@@ -1,0 +1,42 @@
+{
+  "name": "nexus-ai",
+  "version": "1.0.0",
+  "description": "Your personal AI assistant — private, local, always-on",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "setup": "node src/wizard.js",
+    "wizard": "node src/wizard.js"
+  },
+  "keywords": [
+    "ai",
+    "assistant",
+    "chatbot",
+    "openai",
+    "gemini",
+    "local"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "@slack/bolt": "^4.1.0",
+    "better-sqlite3": "^11.7.0",
+    "chalk": "^5.3.0",
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.0",
+    "inquirer": "^12.3.0",
+    "multer": "^1.4.5-lts.1",
+    "node-telegram-bot-api": "^0.66.0",
+    "openai": "^4.73.0",
+    "ora": "^8.1.0",
+    "pm2": "^5.4.0",
+    "qrcode-terminal": "^0.12.0",
+    "uuid": "^11.0.0",
+    "whatsapp-web.js": "^1.26.0",
+    "ws": "^8.18.0"
+  }
+}

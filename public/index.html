@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Nexus AI — Your private, local AI assistant with multi-platform chat integration">
+  <title>Nexus AI — Private AI Assistant</title>
+  <link rel="stylesheet" href="/css/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✦</text></svg>">
+</head>
+<body>
+  <!-- Background Orbs -->
+  <div class="bg-orbs"></div>
+
+  <div id="app">
+    <!-- Mobile Overlay -->
+    <div class="mobile-overlay" id="mobile-overlay" onclick="toggleSidebar()"></div>
+
+    <!-- ═══ SIDEBAR ═══ -->
+    <aside class="sidebar" id="sidebar">
+      <!-- Logo -->
+      <div class="sidebar-logo">
+        <div class="logo-icon">✦</div>
+        <span class="logo-text">Nexus AI</span>
+        <span class="logo-badge">LOCAL</span>
+      </div>
+
+      <!-- New Chat Button -->
+      <button class="new-chat-btn" id="new-chat-btn" onclick="newChat()">
+        <span>＋</span> New Chat
+      </button>
+
+      <!-- Conversation List -->
+      <div class="conversation-list" id="conversation-list">
+        <div class="empty-conversations">
+          No conversations yet.<br>Start a new chat!
+        </div>
+      </div>
+
+      <!-- Platform Status -->
+      <div class="sidebar-platforms" id="platform-status">
+        <div class="platform-label">Connected Platforms</div>
+        <div class="platform-grid">
+          <div class="platform-item" data-platform="telegram">
+            <div class="platform-dot" id="dot-telegram"></div>
+            <span>Telegram</span>
+          </div>
+          <div class="platform-item" data-platform="discord">
+            <div class="platform-dot" id="dot-discord"></div>
+            <span>Discord</span>
+          </div>
+          <div class="platform-item" data-platform="slack">
+            <div class="platform-dot" id="dot-slack"></div>
+            <span>Slack</span>
+          </div>
+          <div class="platform-item" data-platform="whatsapp">
+            <div class="platform-dot" id="dot-whatsapp"></div>
+            <span>WhatsApp</span>
+          </div>
+          <div class="platform-item" data-platform="imessage">
+            <div class="platform-dot" id="dot-imessage"></div>
+            <span>iMessage</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Sidebar Footer -->
+      <div class="sidebar-footer">
+        <button onclick="openSettings()" title="Settings">⚙️</button>
+        <button onclick="fetchStats()" title="Stats">📊</button>
+      </div>
+    </aside>
+
+    <!-- ═══ MAIN AREA ═══ -->
+    <main class="main-area">
+      <!-- Top Bar -->
+      <div class="top-bar">
+        <button class="mobile-menu-btn" onclick="toggleSidebar()">☰</button>
+        <div class="top-bar-title" id="top-bar-title">Nexus AI</div>
+        <div class="model-badge" id="model-badge">GPT-4o Mini</div>
+        <div class="top-bar-actions">
+          <button onclick="clearChat()" title="Clear conversation">🗑️</button>
+        </div>
+      </div>
+
+      <!-- Welcome Screen -->
+      <div class="welcome-screen" id="welcome-screen">
+        <div class="welcome-icon">✦</div>
+        <h1 class="welcome-title">Welcome to Nexus AI</h1>
+        <p class="welcome-subtitle">
+          Your private AI assistant running locally. Ask me anything — your data never leaves this machine.
+        </p>
+        <div class="welcome-chips">
+          <button class="welcome-chip" onclick="sendSuggestion('Explain quantum computing in simple terms')">
+            🔬 Explain quantum computing
+          </button>
+          <button class="welcome-chip" onclick="sendSuggestion('Write a Python script to rename files in a folder')">
+            💻 Write a Python script
+          </button>
+          <button class="welcome-chip" onclick="sendSuggestion('Draft a professional email declining a meeting')">
+            ✉️ Draft a professional email
+          </button>
+          <button class="welcome-chip" onclick="sendSuggestion('What are the best practices for REST API design?')">
+            🔧 REST API best practices
+          </button>
+        </div>
+      </div>
+
+      <!-- Messages Area -->
+      <div class="messages-area" id="messages-area"></div>
+
+      <!-- Input Area -->
+      <div class="input-area">
+        <div class="input-wrapper">
+          <textarea 
+            id="message-input" 
+            placeholder="Ask Nexus anything..." 
+            rows="1"
+            onkeydown="handleKeyDown(event)"
+            oninput="autoResize(this)"
+          ></textarea>
+          <button class="voice-btn" id="voice-btn" onclick="toggleVoice()" title="Voice input">
+            🎙️
+          </button>
+          <button class="send-btn" id="send-btn" onclick="sendMessage()" disabled title="Send message">
+            ➤
+          </button>
+        </div>
+        <div class="input-footer">
+          Nexus AI is running locally <span class="dot"></span> All data stays on your machine
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal-overlay" id="settings-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h2>⚙️ Settings</h2>
+        <button class="modal-close" onclick="closeSettings()">✕</button>
+      </div>
+      <div class="modal-body" id="settings-body">
+        <div class="setting-group">
+          <div class="setting-label">AI Model</div>
+          <select class="setting-input" id="setting-model" disabled>
+            <optgroup label="OpenAI">
+              <option value="gpt-4o-mini">GPT-4o Mini</option>
+              <option value="gpt-4o">GPT-4o</option>
+              <option value="gpt-4-turbo">GPT-4 Turbo</option>
+            </optgroup>
+            <optgroup label="Google Gemini">
+              <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+              <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+              <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+              <option value="gemini-2.0-flash-lite">Gemini 2.0 Flash Lite</option>
+            </optgroup>
+          </select>
+        </div>
+        <div class="setting-group">
+          <div class="setting-label">Statistics</div>
+          <div class="stats-grid" id="stats-grid">
+            <div class="stat-card">
+              <div class="stat-value" id="stat-conversations">—</div>
+              <div class="stat-label">Conversations</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-value" id="stat-messages">—</div>
+              <div class="stat-label">Messages</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-value" id="stat-tokens">—</div>
+              <div class="stat-label">Tokens Used</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-value" id="stat-uptime">—</div>
+              <div class="stat-label">Uptime</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>
