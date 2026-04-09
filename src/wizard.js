@@ -44,13 +44,15 @@ async function main() {
     choices: [
       { name: '🟢 OpenAI       — GPT-4o, GPT-4o Mini  (requires API key)', value: 'openai' },
       { name: '🔷 Google Gemini — Gemini 2.5 Pro/Flash (requires API key)', value: 'gemini' },
-      { name: '🔀 Both         — Use both providers (switch in dashboard)', value: 'both' }
+      { name: '🟩 NVIDIA       — Llama 3.1, Nemotron  (build.nvidia.com)', value: 'nvidia' },
+      { name: '🔀 All          — Setup all providers (switch in dashboard)', value: 'both' }
     ],
     default: existingConfig.AI_PROVIDER || 'openai'
   }]);
 
   let openaiKey = '';
   let geminiKey = '';
+  let nvidiaKey = '';
   let selectedModel = '';
 
   // ─── OpenAI Key ──────────────────────────────────────
@@ -125,6 +127,42 @@ async function main() {
     }
   }
 
+  // ─── NVIDIA Key ──────────────────────────────────────
+
+  if (provider === 'nvidia' || provider === 'both') {
+    console.log(chalk.hex('#76B900').bold('\n  ━━━ NVIDIA NIM Configuration ━━━'));
+    console.log(chalk.gray('  Get your key at: https://build.nvidia.com\n'));
+
+    const { key } = await inquirer.prompt([{
+      type: 'password',
+      name: 'key',
+      message: 'NVIDIA API key:',
+      mask: '•',
+      default: existingConfig.NVIDIA_API_KEY || undefined,
+      validate: (input) => {
+        if (!input || input.length < 10) return 'Please enter a valid API key';
+        return true;
+      }
+    }]);
+
+    const spinner = ora('  Validating NVIDIA key...').start();
+    try {
+      // NVIDIA uses OpenAI compatible endpoint
+      const client = new OpenAI({ 
+        apiKey: key, 
+        baseURL: 'https://integrate.api.nvidia.com/v1' 
+      });
+      await client.models.list();
+      spinner.succeed(chalk.green('  NVIDIA key is valid!'));
+      nvidiaKey = key;
+    } catch (error) {
+      spinner.fail(chalk.red('  Invalid NVIDIA key.'));
+      console.log(chalk.gray(`  Error: ${error.message}\n`));
+      if (provider === 'nvidia') process.exit(1);
+      console.log(chalk.yellow('  Continuing without NVIDIA...\n'));
+    }
+  }
+
   // ─── Model Selection ─────────────────────────────────
 
   console.log(chalk.hex('#6C5CE7').bold('\n  ━━━ Model Selection ━━━\n'));
@@ -150,8 +188,18 @@ async function main() {
     );
   }
 
+  if (nvidiaKey) {
+    modelChoices.push(
+      new inquirer.Separator(chalk.hex('#76B900')(' ── NVIDIA NIM ──')),
+      { name: 'Qwen 3 Coder 480B (A35B) Instruct — Powerful coding model', value: 'qwen/qwen3-coder-480b-a35b-instruct' },
+      { name: 'Llama 3.1 70B Instruct  — Fast & capable open model', value: 'meta/llama-3.1-70b-instruct' },
+      { name: 'Nemotron 4 340B Instruct — High-end NVIDIA model', value: 'nvidia/nemotron-4-340b-instruct' },
+      { name: 'Llama 3.1 405B Instruct — Massive capable open model', value: 'meta/llama-3.1-405b-instruct' }
+    );
+  }
+
   const defaultModel = existingConfig.AI_MODEL || existingConfig.OPENAI_MODEL || 
-    (geminiKey && !openaiKey ? 'gemini-2.5-flash' : 'gpt-4o-mini');
+    (geminiKey && !openaiKey && !nvidiaKey ? 'gemini-2.5-flash' : (nvidiaKey && !openaiKey && !geminiKey ? 'meta/llama-3.1-70b-instruct' : 'gpt-4o-mini'));
 
   const { model } = await inquirer.prompt([{
     type: 'list',
@@ -162,7 +210,7 @@ async function main() {
   }]);
 
   selectedModel = model;
-  const activeProvider = model.startsWith('gemini') ? 'gemini' : 'openai';
+  const activeProvider = model.startsWith('gemini') ? 'gemini' : (model.includes('/') ? 'nvidia' : 'openai');
 
   // ─── Step 2: Platform Selection ──────────────────────
 
@@ -188,6 +236,7 @@ async function main() {
     AI_PROVIDER: activeProvider,
     OPENAI_API_KEY: openaiKey || '',
     GEMINI_API_KEY: geminiKey || '',
+    NVIDIA_API_KEY: nvidiaKey || '',
     AI_MODEL: selectedModel,
     PORT: existingConfig.PORT || '3000',
     TELEGRAM_ENABLED: 'false',
@@ -202,7 +251,7 @@ async function main() {
     VOICE_ENABLED: 'true',
     VOICE_MODEL: 'tts-1',
     VOICE_NAME: 'alloy',
-    SYSTEM_PROMPT: existingConfig.SYSTEM_PROMPT || 'You are Nexus, a helpful, friendly, and knowledgeable personal AI assistant. You are concise but thorough. You remember context from our conversation. You are running locally and all data stays private.'
+    SYSTEM_PROMPT: existingConfig.SYSTEM_PROMPT || "You are Khellon's personal AI assistant. You have full access to a local Chrome browser via PinchTab tools (browser_navigate, browser_snapshot, browser_action, browser_extract_text). You must use these to autonomously check his college portal and read web news online. You must autonomously maintain awareness of his college environment and trigger send_urgent_notification for important updates."
   };
 
   if (platforms.includes('telegram')) {
@@ -379,6 +428,9 @@ OPENAI_API_KEY=${config.OPENAI_API_KEY}
 
 # ═══ Google Gemini ═══
 GEMINI_API_KEY=${config.GEMINI_API_KEY}
+
+# ═══ NVIDIA NIM ═══
+NVIDIA_API_KEY=${config.NVIDIA_API_KEY || ''}
 
 # ═══ Web Dashboard ═══
 PORT=${config.PORT}

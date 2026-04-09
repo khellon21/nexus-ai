@@ -4,7 +4,7 @@
 // Logs:       pm2 logs nexus-ai
 // Stop:       pm2 stop nexus-ai
 
-export default {
+module.exports = {
   apps: [{
     name: 'nexus-ai',
     script: 'src/index.js',

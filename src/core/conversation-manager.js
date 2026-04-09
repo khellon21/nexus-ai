@@ -1,7 +1,10 @@
+import { ToolExecutor } from './tools.js';
+
 export class ConversationManager {
   constructor(database, aiEngine, options = {}) {
     this.db = database;
     this.ai = aiEngine;
+    this.toolExecutor = new ToolExecutor(this);
     this.contextWindow = options.contextWindow || 20;
     this.autoTitle = options.autoTitle !== false;
   }
@@ -21,8 +24,31 @@ export class ConversationManager {
       content: m.content
     }));
 
-    // Get AI response
-    const response = await this.ai.chat(contextMessages);
+    // Tool loop
+    let response = await this.ai.chat(contextMessages);
+    
+    while (response.tool_calls && response.tool_calls.length > 0) {
+      // Append assistant's tool call message
+      contextMessages.push({
+        role: 'assistant',
+        content: response.content || "",
+        tool_calls: response.tool_calls
+      });
+
+      // Execute all tools
+      for (const call of response.tool_calls) {
+        const resultString = await this.toolExecutor.execute(call.function);
+        contextMessages.push({
+          role: 'tool',
+          name: call.function.name,
+          tool_call_id: call.id,
+          content: resultString
+        });
+      }
+
+      // Call AI again with tool results
+      response = await this.ai.chat(contextMessages);
+    }
 
     // Store the assistant response
     this.db.addMessage(conversationId, 'assistant', response.content, platform, response.usage.totalTokens);
@@ -51,7 +77,30 @@ export class ConversationManager {
       content: m.content
     }));
 
-    const response = await this.ai.chatStream(contextMessages, onChunk);
+    let response = await this.ai.chatStream(contextMessages, onChunk);
+
+    // If tools are called during stream (which usually breaks streaming in some libs, but we fallback)
+    // Most standard SDKs don't stream tool calls well in simple wrapeprs, 
+    // but if tool_calls are returned, we handle them recursively using regular chat to resolve tools first.
+    while (response.tool_calls && response.tool_calls.length > 0) {
+      contextMessages.push({
+        role: 'assistant',
+        content: response.content || "",
+        tool_calls: response.tool_calls
+      });
+
+      for (const call of response.tool_calls) {
+        const resultString = await this.toolExecutor.execute(call.function);
+        contextMessages.push({
+          role: 'tool',
+          name: call.function.name,
+          tool_call_id: call.id,
+          content: resultString
+        });
+      }
+      // Re-stream the final answer
+      response = await this.ai.chatStream(contextMessages, onChunk);
+    }
 
     this.db.addMessage(conversationId, 'assistant', response.content, platform);
 
@@ -78,8 +127,29 @@ export class ConversationManager {
       content: m.content
     }));
 
-    const response = await this.ai.chat(contextMessages);
-    this.db.addMessage(conversationId, 'assistant', response.content, 'web', response.usage.totalTokens);
+    let response = await this.ai.chat(contextMessages);
+    
+    while (response.tool_calls && response.tool_calls.length > 0) {
+      contextMessages.push({
+        role: 'assistant',
+        content: response.content || "",
+        tool_calls: response.tool_calls
+      });
+
+      for (const call of response.tool_calls) {
+        const resultString = await this.toolExecutor.execute(call.function);
+        contextMessages.push({
+          role: 'tool',
+          name: call.function.name,
+          tool_call_id: call.id,
+          content: resultString
+        });
+      }
+
+      response = await this.ai.chat(contextMessages);
+    }
+
+    this.db.addMessage(conversationId, 'assistant', response.content, 'web', response.usage?.totalTokens || 0);
 
     const conv = this.db.getConversation(conversationId);
     if (this.autoTitle && conv.title === 'New Conversation') {
@@ -106,7 +176,28 @@ export class ConversationManager {
       content: m.content
     }));
 
-    const response = await this.ai.chatStream(contextMessages, onChunk);
+    let response = await this.ai.chatStream(contextMessages, onChunk);
+
+    while (response.tool_calls && response.tool_calls.length > 0) {
+      contextMessages.push({
+        role: 'assistant',
+        content: response.content || "",
+        tool_calls: response.tool_calls
+      });
+
+      for (const call of response.tool_calls) {
+        const resultString = await this.toolExecutor.execute(call.function);
+        contextMessages.push({
+          role: 'tool',
+          name: call.function.name,
+          tool_call_id: call.id,
+          content: resultString
+        });
+      }
+
+      response = await this.ai.chatStream(contextMessages, onChunk);
+    }
+
     this.db.addMessage(conversationId, 'assistant', response.content, 'web');
 
     const conv = this.db.getConversation(conversationId);

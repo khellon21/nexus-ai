@@ -38,8 +38,10 @@ async function main() {
 
   const hasOpenAI = process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'sk-your-key-here';
   const hasGemini = !!process.env.GEMINI_API_KEY;
-  if (!hasOpenAI && !hasGemini) {
-    console.log('\x1b[33m  ⚠ No AI provider configured. Run "npm run setup" to set up OpenAI or Gemini.\x1b[0m\n');
+  const hasNVIDIA = !!process.env.NVIDIA_API_KEY;
+  
+  if (!hasOpenAI && !hasGemini && !hasNVIDIA) {
+    console.log('\x1b[33m  ⚠ No AI provider configured. Run "npm run setup" to set up OpenAI, Gemini, or NVIDIA.\x1b[0m\n');
     process.exit(1);
   }
 
@@ -48,7 +50,7 @@ async function main() {
   // ─── Initialize Core ─────────────────────────────────
   const ai = new AIEngine({
     model: process.env.AI_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    provider: process.env.AI_PROVIDER || (hasGemini && !hasOpenAI ? 'gemini' : 'openai'),
+    provider: process.env.AI_PROVIDER || (hasGemini && !hasOpenAI && !hasNVIDIA ? 'gemini' : (hasNVIDIA ? 'nvidia' : 'openai')),
     systemPrompt: process.env.SYSTEM_PROMPT
   });
   ai.initialize();
@@ -57,6 +59,12 @@ async function main() {
   db.initialize();
 
   const cm = new ConversationManager(db, ai, { contextWindow: 20 });
+
+  // ─── Start Background Monitor ────────────────────────
+  import('./core/background-monitor.js').then(({ BackgroundMonitor }) => {
+    const monitor = new BackgroundMonitor(cm);
+    monitor.start();
+  }).catch(e => console.error("Failed to load background monitor:", e));
 
   // ─── Initialize Voice ─────────────────────────────────
   const voice = new VoiceAdapter(ai);
@@ -119,7 +127,8 @@ async function main() {
     console.log(`  │   \x1b[35m✦ Nexus AI is running!\x1b[0m                    │`);
     console.log(`  │                                             │`);
     console.log(`  │   Dashboard: \x1b[36mhttp://localhost:${port}\x1b[0m${' '.repeat(13 - port.toString().length)}│`);
-    const providerTag = ai.provider === 'gemini' ? '🔷 Gemini' : '🟢 OpenAI';
+    const rawProvider = process.env.AI_PROVIDER || 'openai';
+    const providerTag = rawProvider === 'gemini' ? '🔷 Gemini' : rawProvider === 'nvidia' ? '🟢 NVIDIA' : '🟢 OpenAI';
     console.log(`  │   Provider:  \x1b[33m${providerTag.padEnd(28)}\x1b[0m│`);
     console.log(`  │   Model:     \x1b[33m${ai.model.padEnd(28)}\x1b[0m│`);
     console.log(`  │                                             │`);

@@ -1,10 +1,12 @@
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { EventEmitter } from 'events';
+import { getToolsSchema } from './tools.js';
 
 // ─── Provider Detection ─────────────────────────────────
 function detectProvider(model) {
   if (model.startsWith('gemini')) return 'gemini';
+  if (model.includes('/')) return 'nvidia';
   return 'openai';
 }
 
@@ -13,6 +15,7 @@ export class AIEngine extends EventEmitter {
     super();
     this.openaiClient = null;
     this.geminiClient = null;
+    this.nvidiaClient = null;
     this.geminiModel = null;
     this.model = config.model || process.env.AI_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
     this.provider = config.provider || process.env.AI_PROVIDER || detectProvider(this.model);
@@ -38,6 +41,15 @@ export class AIEngine extends EventEmitter {
       });
     }
 
+    // Initialize NVIDIA if configured
+    const nvidiaKey = process.env.NVIDIA_API_KEY;
+    if (nvidiaKey) {
+      this.nvidiaClient = new OpenAI({ 
+        apiKey: nvidiaKey, 
+        baseURL: 'https://integrate.api.nvidia.com/v1' 
+      });
+    }
+
     // Validate that the chosen provider has credentials
     if (this.provider === 'openai' && !this.openaiClient) {
       throw new Error('OpenAI provider selected but OPENAI_API_KEY is not set. Run `npm run setup`.');
@@ -45,8 +57,11 @@ export class AIEngine extends EventEmitter {
     if (this.provider === 'gemini' && !this.geminiClient) {
       throw new Error('Gemini provider selected but GEMINI_API_KEY is not set. Run `npm run setup`.');
     }
+    if (this.provider === 'nvidia' && !this.nvidiaClient) {
+      throw new Error('NVIDIA provider selected but NVIDIA_API_KEY is not set. Run `npm run setup`.');
+    }
 
-    const providerLabel = this.provider === 'gemini' ? 'Google Gemini' : 'OpenAI';
+    const providerLabel = this.provider === 'gemini' ? 'Google Gemini' : (this.provider === 'nvidia' ? 'NVIDIA NIM' : 'OpenAI');
     console.log(`  ✓ AI Engine initialized (${providerLabel}: ${this.model})`);
   }
 
@@ -59,32 +74,44 @@ export class AIEngine extends EventEmitter {
     if (provider === 'gemini') {
       return this._geminiChat(messages, { ...options, model });
     }
-    return this._openaiChat(messages, { ...options, model });
+    return this._openaiChat(messages, provider, { ...options, model });
   }
 
-  async _openaiChat(messages, options = {}) {
-    if (!this.openaiClient) throw new Error('OpenAI client not initialized');
+  async _openaiChat(messages, provider, options = {}) {
+    const client = provider === 'nvidia' ? this.nvidiaClient : this.openaiClient;
+    if (!client) throw new Error(`${provider} client not initialized`);
 
     const systemMessage = { role: 'system', content: this.systemPrompt };
-    const formattedMessages = [systemMessage, ...messages.map(m => ({
-      role: m.role, content: m.content
-    }))];
+    const formattedMessages = [systemMessage, ...messages.map(m => {
+      const msg = { role: m.role, content: m.content };
+      if (m.tool_calls) msg.tool_calls = m.tool_calls;
+      if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+      if (m.name) msg.name = m.name;
+      return msg;
+    })];
+
+    const tools = getToolsSchema('openai');
 
     try {
-      const response = await this.openaiClient.chat.completions.create({
+      const response = await client.chat.completions.create({
         model: options.model || this.model,
         messages: formattedMessages,
         max_tokens: options.maxTokens || this.maxTokens,
         temperature: options.temperature || this.temperature,
+        tools: tools,
+        tool_choice: "auto"
       });
 
-      const reply = response.choices[0]?.message?.content || '';
+      const messageObj = response.choices[0]?.message;
+      const reply = messageObj?.content || '';
       const usage = response.usage;
+      const toolCalls = messageObj?.tool_calls || null;
 
       return {
         content: reply,
+        tool_calls: toolCalls,
         model: response.model,
-        provider: 'openai',
+        provider: provider,
         usage: {
           promptTokens: usage?.prompt_tokens || 0,
           completionTokens: usage?.completion_tokens || 0,
@@ -92,8 +119,8 @@ export class AIEngine extends EventEmitter {
         }
       };
     } catch (error) {
-      if (error.status === 401) throw new Error('Invalid OpenAI API key. Run `npm run setup`.');
-      if (error.status === 429) throw new Error('OpenAI rate limit reached. Please wait.');
+      if (error.status === 401) throw new Error(`Invalid ${provider === 'nvidia' ? 'NVIDIA' : 'OpenAI'} API key. Run \`npm run setup\`.`);
+      if (error.status === 429) throw new Error(`${provider === 'nvidia' ? 'NVIDIA NIM' : 'OpenAI'} rate limit reached. Please wait.`);
       throw error;
     }
   }
@@ -109,34 +136,68 @@ export class AIEngine extends EventEmitter {
     const geminiMessages = messages.filter(m => m.role !== 'system');
 
     for (const msg of geminiMessages) {
-      history.push({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content }]
-      });
+      if (msg.role === 'tool') {
+        history.push({
+          role: 'function',
+          parts: [{ functionResponse: { name: msg.name, response: { content: msg.content } } }]
+        });
+      } else if (msg.role === 'assistant') {
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          const parts = [];
+          if (msg.content) parts.push({ text: msg.content });
+          for (const call of msg.tool_calls) {
+            try {
+              parts.push({ functionCall: { name: call.function.name, args: JSON.parse(call.function.arguments || '{}') } });
+            } catch (e) {}
+          }
+          history.push({ role: 'model', parts });
+        } else {
+          history.push({ role: 'model', parts: [{ text: msg.content || '' }] });
+        }
+      } else {
+        history.push({ role: 'user', parts: [{ text: msg.content || '' }] });
+      }
     }
 
-    // Pop the last user message to use as the prompt
-    const lastUserMsg = history.length > 0 && history[history.length - 1].role === 'user'
+    // Pop the last message to use as the prompt (can be user text or function response)
+    const lastMsg = history.length > 0 && (history[history.length - 1].role === 'user' || history[history.length - 1].role === 'function')
       ? history.pop() : null;
 
-    if (!lastUserMsg) throw new Error('No user message to send');
+    if (!lastMsg) throw new Error('No user message to send');
+
+    const tools = getToolsSchema('gemini');
 
     try {
       const chat = genModel.startChat({
         history,
         systemInstruction: { parts: [{ text: this.systemPrompt }] },
+        tools: [{ functionDeclarations: tools }],
         generationConfig: {
           maxOutputTokens: options.maxTokens || this.maxTokens,
           temperature: options.temperature || this.temperature,
         }
       });
 
-      const result = await chat.sendMessage(lastUserMsg.parts[0].text);
+      const result = await chat.sendMessage(lastMsg.parts);
       const text = result.response.text();
+      const functionCalls = result.response.functionCalls();
       const usageMetadata = result.response.usageMetadata || {};
+
+      let formattedToolCalls = null;
+      if (functionCalls && functionCalls.length > 0) {
+          formattedToolCalls = functionCalls.map(fc => ({
+              id: Math.random().toString(36).substring(7),
+              type: 'function',
+              function: {
+                 name: fc.name,
+                 arguments: JSON.stringify(fc.args)
+              }
+          }));
+      }
 
       return {
         content: text,
+        tool_calls: formattedToolCalls,
         model: modelName,
         provider: 'gemini',
         usage: {
@@ -168,36 +229,59 @@ export class AIEngine extends EventEmitter {
     if (provider === 'gemini') {
       return this._geminiChatStream(messages, onChunk, { ...options, model });
     }
-    return this._openaiChatStream(messages, onChunk, { ...options, model });
+    return this._openaiChatStream(messages, provider, onChunk, { ...options, model });
   }
 
-  async _openaiChatStream(messages, onChunk, options = {}) {
-    if (!this.openaiClient) throw new Error('OpenAI client not initialized');
+  async _openaiChatStream(messages, provider, onChunk, options = {}) {
+    const client = provider === 'nvidia' ? this.nvidiaClient : this.openaiClient;
+    if (!client) throw new Error(`${provider} client not initialized`);
 
     const systemMessage = { role: 'system', content: this.systemPrompt };
-    const formattedMessages = [systemMessage, ...messages.map(m => ({
-      role: m.role, content: m.content
-    }))];
+    const formattedMessages = [systemMessage, ...messages.map(m => {
+      const msg = { role: m.role, content: m.content };
+      if (m.tool_calls) msg.tool_calls = m.tool_calls;
+      if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+      if (m.name) msg.name = m.name;
+      return msg;
+    })];
 
     try {
-      const stream = await this.openaiClient.chat.completions.create({
+      const stream = await client.chat.completions.create({
         model: options.model || this.model,
         messages: formattedMessages,
         max_tokens: options.maxTokens || this.maxTokens,
         temperature: options.temperature || this.temperature,
+        tools: getToolsSchema('openai'),
+        tool_choice: "auto",
         stream: true
       });
 
       let fullContent = '';
+      let toolCallsList = [];
+      
       for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta?.content || '';
-        if (delta) {
-          fullContent += delta;
-          if (onChunk) onChunk(delta, fullContent);
+        const delta = chunk.choices[0]?.delta;
+        if (!delta) continue;
+
+        if (delta.content) {
+          fullContent += delta.content;
+          if (onChunk) onChunk(delta.content, fullContent);
+        }
+
+        if (delta.tool_calls) {
+           for (const tc of delta.tool_calls) {
+             const idx = tc.index;
+             if (!toolCallsList[idx]) {
+               toolCallsList[idx] = { id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments || '' } };
+             } else {
+               toolCallsList[idx].function.arguments += (tc.function.arguments || '');
+             }
+           }
         }
       }
 
-      return { content: fullContent, provider: 'openai' };
+      const formattedToolCalls = toolCallsList.length > 0 ? toolCallsList.filter(Boolean) : null;
+      return { content: fullContent, tool_calls: formattedToolCalls, provider: 'openai' };
     } catch (error) {
       if (error.status === 401) throw new Error('Invalid OpenAI API key. Run `npm run setup`.');
       throw error;
@@ -214,39 +298,76 @@ export class AIEngine extends EventEmitter {
     const geminiMessages = messages.filter(m => m.role !== 'system');
 
     for (const msg of geminiMessages) {
-      history.push({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content }]
-      });
+      if (msg.role === 'tool') {
+        history.push({
+          role: 'function',
+          parts: [{ functionResponse: { name: msg.name, response: { content: msg.content } } }]
+        });
+      } else if (msg.role === 'assistant') {
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          const parts = [];
+          if (msg.content) parts.push({ text: msg.content });
+          for (const call of msg.tool_calls) {
+            try {
+              parts.push({ functionCall: { name: call.function.name, args: JSON.parse(call.function.arguments || '{}') } });
+            } catch (e) {}
+          }
+          history.push({ role: 'model', parts });
+        } else {
+          history.push({ role: 'model', parts: [{ text: msg.content || '' }] });
+        }
+      } else {
+        history.push({ role: 'user', parts: [{ text: msg.content || '' }] });
+      }
     }
 
-    const lastUserMsg = history.length > 0 && history[history.length - 1].role === 'user'
+    const lastMsg = history.length > 0 && (history[history.length - 1].role === 'user' || history[history.length - 1].role === 'function')
       ? history.pop() : null;
 
-    if (!lastUserMsg) throw new Error('No user message to send');
+    if (!lastMsg) throw new Error('No user message to send');
+
+    const tools = getToolsSchema('gemini');
 
     try {
       const chat = genModel.startChat({
         history,
         systemInstruction: { parts: [{ text: this.systemPrompt }] },
+        tools: [{ functionDeclarations: tools }],
         generationConfig: {
           maxOutputTokens: options.maxTokens || this.maxTokens,
           temperature: options.temperature || this.temperature,
         }
       });
 
-      const result = await chat.sendMessageStream(lastUserMsg.parts[0].text);
+      const result = await chat.sendMessageStream(lastMsg.parts);
 
       let fullContent = '';
+      let functionCalls = [];
+
       for await (const chunk of result.stream) {
-        const text = chunk.text();
-        if (text) {
-          fullContent += text;
-          if (onChunk) onChunk(text, fullContent);
+        const fCalls = chunk.functionCalls();
+        if (fCalls && fCalls.length > 0) {
+           functionCalls.push(...fCalls);
         }
+        try {
+           const text = chunk.text();
+           if (text) {
+             fullContent += text;
+             if (onChunk) onChunk(text, fullContent);
+           }
+        } catch (e) {} // chunk.text() throws if it's only a function call
       }
 
-      return { content: fullContent, provider: 'gemini' };
+      let formattedToolCalls = null;
+      if (functionCalls.length > 0) {
+          formattedToolCalls = functionCalls.map(fc => ({
+              id: Math.random().toString(36).substring(7),
+              type: 'function',
+              function: { name: fc.name, arguments: JSON.stringify(fc.args) }
+          }));
+      }
+
+      return { content: fullContent, tool_calls: formattedToolCalls, provider: 'gemini' };
     } catch (error) {
       if (error.message?.includes('API_KEY_INVALID')) {
         throw new Error('Invalid Gemini API key. Run `npm run setup`.');
