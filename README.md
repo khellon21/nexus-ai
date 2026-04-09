@@ -2,7 +2,7 @@
 
 **Your Private AI Assistant — Local, Fast, Always-On**
 
-Nexus AI is a self-hosted personal AI assistant powered by OpenAI that connects to all your chat platforms. Think of it as your own private ChatGPT that you control, with your data never leaving your machine.
+Nexus AI is a self-hosted personal AI assistant powered by NVIDIA NIM, OpenAI, and Google Gemini that connects to all your chat platforms. Think of it as your own private ChatGPT that you control, with your data never leaving your machine. It features autonomous web browsing using PinchTab and fully processes documents globally.
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-18%2B-green)
@@ -13,11 +13,13 @@ Nexus AI is a self-hosted personal AI assistant powered by OpenAI that connects 
 ## ✨ Features
 
 - 🔒 **Fully Local** — All conversations stored in SQLite on your machine
-- 🤖 **OpenAI Powered** — GPT-4o, GPT-4o-mini, GPT-4 Turbo
+- 🧠 **Multi-Model Powered** — Use OpenAI, Gemini 2.5, or high-performance open-weights like Qwen 3 Coder 480B via NVIDIA NIM
+- 🌐 **Deep Web Browsing** — Autonomous navigation and physical DOM interaction powered by PinchTab headless orchestration
+- 📄 **Document Parsing** — Automatic PDF and text extraction directly through Telegram messages
 - 💬 **Multi-Platform** — WhatsApp, Telegram, Discord, Slack, iMessage
 - 🎙️ **Voice** — Speak to your assistant (Whisper STT + OpenAI TTS)
 - 🖥️ **Premium Dashboard** — Beautiful dark-mode web interface
-- ⚡ **Always-On** — PM2 background process with auto-restart
+- ⚡ **Always-On** — PM2 background process with scheduled monitoring loops
 - 🔧 **Easy Setup** — Interactive CLI wizard guides you through everything
 
 ---
@@ -26,7 +28,8 @@ Nexus AI is a self-hosted personal AI assistant powered by OpenAI that connects 
 
 ### Prerequisites
 - **Node.js 18+** — [Download](https://nodejs.org)
-- **OpenAI API Key** — [Get one](https://platform.openai.com/api-keys)
+- **API Key** — OpenAI, Google Gemini, or [NVIDIA NIM](https://build.nvidia.com)
+- **PinchTab (Optional)** — Required for autonomous background web scraping
 
 ### Install & Setup
 
@@ -45,7 +48,7 @@ npm start
 ```
 
 The setup wizard will walk you through:
-1. ✅ OpenAI API key validation
+1. ✅ AI Provider Selection (NVIDIA, Gemini, OpenAI)
 2. 🔌 Platform selection & credentials
 3. 🎙️ Voice configuration
 4. 🧠 AI personality customization
@@ -158,8 +161,8 @@ Edit `.env` directly or re-run `npm run setup`:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `OPENAI_API_KEY` | Your OpenAI API key | Required |
-| `OPENAI_MODEL` | AI model to use | `gpt-4o-mini` |
+| `AI_PROVIDER` | AI Provider | `openai` (or `gemini`, `nvidia`) |
+| `AI_MODEL` | AI model to use | `gpt-4o-mini` |
 | `PORT` | Web dashboard port | `3000` |
 | `VOICE_ENABLED` | Enable voice features | `true` |
 | `VOICE_NAME` | TTS voice selection | `alloy` |
