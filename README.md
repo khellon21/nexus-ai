@@ -13,6 +13,20 @@ Nexus AI now features **Cipher**, a specialized Playwright-based autonomous agen
 
 ---
 
+## ⚡ One-Line Install
+
+**macOS / Linux:**
+```bash
+curl -fsSL https://raw.githubusercontent.com/khellon21/nexus-ai/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+powershell -c "irm https://raw.githubusercontent.com/khellon21/nexus-ai/main/install.ps1 | iex"
+```
+
+---
+
 ## ✨ Core Features
 
 - 🔒 **Fully Local** — All conversations stored in SQLite on your machine.
