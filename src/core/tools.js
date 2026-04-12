@@ -72,6 +72,38 @@ export const getToolsSchema = (provider) => {
         description: 'Extracts the visible, readable content text from the current webpage. Use this to quickly read the contents of an article or announcement without worrying about HTML boilerplate.',
         parameters: { type: 'object', properties: {} }
       }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'cipher_scan_portal',
+        description: 'Trigger Cipher to immediately scan the university portal for new assignments and deadlines. Returns a summary of found assignments.',
+        parameters: { type: 'object', properties: {} }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'cipher_list_assignments',
+        description: 'Get a list of all mapped college assignments. This includes upcoming homework, past exams, due dates, completion status, evaluation status, and SCORES/GRADES. MUST use this tool whenever the user asks about grades, scores, or assignments.',
+        parameters: { type: 'object', properties: {} }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'cipher_schedule_submission',
+        description: 'Schedule a file to be automatically submitted to a portal assignment dropbox at a specific time.',
+        parameters: {
+          type: 'object',
+          properties: {
+            assignmentId: { type: 'string', description: 'The ID of the assignment to submit to (from cipher_list_assignments)' },
+            filePath: { type: 'string', description: 'The absolute path to the file to submit' },
+            scheduledAt: { type: 'string', description: 'ISO 8601 timestamp for when to submit (e.g. 2026-04-14T10:00:00). Use "now" for immediate submission.' }
+          },
+          required: ['assignmentId', 'filePath']
+        }
+      }
     }
   ];
 
@@ -123,6 +155,12 @@ export class ToolExecutor {
           return await this.browserAction(params.action, params.ref, params.text);
         case 'browser_extract_text':
           return await this.browserExtractText();
+        case 'cipher_scan_portal':
+          return await this.cipherScanPortal();
+        case 'cipher_list_assignments':
+          return await this.cipherListAssignments();
+        case 'cipher_schedule_submission':
+          return await this.cipherScheduleSubmission(params.assignmentId, params.filePath, params.scheduledAt);
         default:
           return JSON.stringify({ error: `Unknown tool: ${name}` });
       }
@@ -221,5 +259,55 @@ export class ToolExecutor {
       delivered_to: "all devices",
       timestamp: new Date().toISOString()
     });
+  }
+
+  // ─── Cipher Tool Implementations ──────────────────────
+
+  async cipherScanPortal() {
+    console.log(`\x1b[35m  [Cipher Tool] Triggering portal scan...\x1b[0m`);
+    if (!this._cipherScheduler) {
+      return JSON.stringify({ error: 'Cipher scheduler not initialized. Check CIPHER_ENABLED in .env.' });
+    }
+
+    try {
+      await this._cipherScheduler.manualScan();
+      const status = this._cipherScheduler.getAssignmentStatus();
+      return JSON.stringify({
+        status: 'success',
+        message: `Scan complete. Found ${status.total} assignments.`,
+        ...status
+      });
+    } catch (e) {
+      return JSON.stringify({ error: `Scan failed: ${e.message}` });
+    }
+  }
+
+  async cipherListAssignments() {
+    console.log(`\x1b[35m  [Cipher Tool] Listing assignments...\x1b[0m`);
+    if (!this._cipherScheduler) {
+      return JSON.stringify({ error: 'Cipher scheduler not initialized.' });
+    }
+
+    const status = this._cipherScheduler.getAssignmentStatus();
+    return JSON.stringify(status);
+  }
+
+  async cipherScheduleSubmission(assignmentId, filePath, scheduledAt) {
+    console.log(`\x1b[35m  [Cipher Tool] Scheduling submission...\x1b[0m`);
+    if (!this._cipherScheduler) {
+      return JSON.stringify({ error: 'Cipher scheduler not initialized.' });
+    }
+
+    try {
+      const when = scheduledAt === 'now' ? new Date().toISOString() : (scheduledAt || new Date().toISOString());
+      const submissionId = this._cipherScheduler.scheduleSubmission(assignmentId, filePath, when);
+      return JSON.stringify({
+        status: 'success',
+        message: `Submission queued for ${when}`,
+        submissionId
+      });
+    } catch (e) {
+      return JSON.stringify({ error: `Failed to schedule: ${e.message}` });
+    }
   }
 }

@@ -66,6 +66,39 @@ async function main() {
     monitor.start();
   }).catch(e => console.error("Failed to load background monitor:", e));
 
+  // ─── Start Cipher — Academic Automation Agent ─────────
+  if (process.env.CIPHER_ENABLED === 'true') {
+    import('./core/cipher-scheduler.js').then(({ CipherScheduler }) => {
+      const cipherScheduler = new CipherScheduler({
+        database: db,
+        telegramBot: null, // Will be set after Telegram adapter starts
+        vaultPath: './data/cipher-vault.enc',
+        portalConfigPath: './config/cipher-portal.json'
+      });
+
+      // Store reference for shutdown and tool access
+      global.__cipherScheduler = cipherScheduler;
+
+      // Inject into tool executor so AI can control Cipher
+      cm.toolExecutor._cipherScheduler = cipherScheduler;
+
+      // Defer start until after adapters connect (Telegram bot injection)
+      setTimeout(() => {
+        // Inject Telegram bot if available
+        if (adapters.telegram && adapters.telegram.bot) {
+          cipherScheduler.notifier.telegramBot = adapters.telegram.bot;
+        }
+        cipherScheduler.start();
+      }, 10000);
+
+      console.log('  ✓ Cipher academic agent initialized');
+    }).catch(e => {
+      console.error('  ✗ Cipher failed to load:', e.message);
+    });
+  } else {
+    console.log('  \x1b[90m○ Cipher: disabled (set CIPHER_ENABLED=true in .env)\x1b[0m');
+  }
+
   // ─── Initialize Voice ─────────────────────────────────
   const voice = new VoiceAdapter(ai);
   voice.initialize();
@@ -158,6 +191,15 @@ async function main() {
         await adapter.stop();
       } catch (e) {
         console.error(`  Error stopping ${name}:`, e.message);
+      }
+    }
+
+    // Stop Cipher scheduler
+    if (global.__cipherScheduler) {
+      try {
+        global.__cipherScheduler.stop();
+      } catch (e) {
+        console.error('  Error stopping Cipher:', e.message);
       }
     }
 

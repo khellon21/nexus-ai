@@ -1,0 +1,18 @@
+{
+  "submissions": [
+    {
+      "_comment": "Example submission mapping — replace with your actual courses",
+      "coursePattern": "CS 301",
+      "assignmentPattern": "Homework #1",
+      "filePath": "/Users/khellonpatel/Assignments/CS301/hw1.pdf",
+      "submitAt": "2026-04-14T10:00:00-04:00",
+      "enabled": false
+    }
+  ],
+
+  "defaults": {
+    "submitMinutesBeforeDeadline": 60,
+    "autoSubmitEnabled": false,
+    "assignmentDirectory": "/Users/khellonpatel/Assignments"
+  }
+}
