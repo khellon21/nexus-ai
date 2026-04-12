@@ -1,119 +1,102 @@
-# ✦ Nexus AI
+# ✦ Nexus AI with Cipher Academic Automation
 
 **Your Private AI Assistant — Local, Fast, Always-On**
 
-Nexus AI is a self-hosted personal AI assistant powered by NVIDIA NIM, OpenAI, and Google Gemini that connects to all your chat platforms. Think of it as your own private ChatGPT that you control, with your data never leaving your machine. It features autonomous web browsing using PinchTab and fully processes documents globally.
+Nexus AI is a self-hosted personal AI assistant powered by NVIDIA NIM, OpenAI, and Google Gemini that connects to all your chat platforms. Think of it as your own private ChatGPT that you control, with your data never leaving your machine.
+
+**✨ NEW: Cipher Academic Agent**  
+Nexus AI now features **Cipher**, a specialized Playwright-based autonomous agent that seamlessly logs into your university portal (e.g., Wright State Pilot/D2L), handles Duo 2FA securely, and pulls your coursework, grades, submission statuses, and upcoming deadlines directly into your localized SQLite database. The AI can then natively answer chat messages like *"What is my score on Quiz 1 in Discrete Structures?"* anytime via Telegram!
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Node](https://img.shields.io/badge/node-18%2B-green)
-![Platforms](https://img.shields.io/badge/platforms-5-violet)
+![Playwright](https://img.shields.io/badge/playwright-ready-orange)
 
 ---
 
-## ✨ Features
+## ✨ Core Features
 
-- 🔒 **Fully Local** — All conversations stored in SQLite on your machine
-- 🧠 **Multi-Model Powered** — Use OpenAI, Gemini 2.5, or high-performance open-weights like Qwen 3 Coder 480B via NVIDIA NIM
-- 🌐 **Deep Web Browsing** — Autonomous navigation and physical DOM interaction powered by PinchTab headless orchestration
-- 📄 **Document Parsing** — Automatic PDF and text extraction directly through Telegram messages
-- 💬 **Multi-Platform** — WhatsApp, Telegram, Discord, Slack, iMessage
-- 🎙️ **Voice** — Speak to your assistant (Whisper STT + OpenAI TTS)
-- 🖥️ **Premium Dashboard** — Beautiful dark-mode web interface
-- ⚡ **Always-On** — PM2 background process with scheduled monitoring loops
-- 🔧 **Easy Setup** — Interactive CLI wizard guides you through everything
+- 🔒 **Fully Local** — All conversations stored in SQLite on your machine.
+- 🧠 **Multi-Model Powered** — Use OpenAI, Gemini, or open-weights like Qwen 3 Coder 480B via NVIDIA NIM.
+- 🎓 **Cipher Academic Agent** — Automatically crawls your college portal (D2L Brightspace), extracts assignments & grades, handles secure SSO + Duo 2FA, and alerts you before deadlines.
+- 💬 **Multi-Platform Supported** — Integrated deeply with Telegram (and expandable to WhatsApp, Discord, Slack, iMessage).
+- 🎙️ **Voice Options** — Speak to your assistant (Whisper STT + OpenAI TTS).
+- 🖥️ **Premium Dashboard** — Beautiful dark-mode web UI for AI management (port `8080`).
+- ⚡ **Always-On** — Continuously monitors via background jobs and PM2.
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start & Setup
 
 ### Prerequisites
-- **Node.js 18+** — [Download](https://nodejs.org)
+- **Node.js 18+**
 - **API Key** — OpenAI, Google Gemini, or [NVIDIA NIM](https://build.nvidia.com)
-- **PinchTab (Optional)** — Required for autonomous background web scraping
+- **Playwright browsers** — Required for Cipher (running `npx playwright install` handles this)
 
-### Install & Setup
+### Install & Initialization
 
 ```bash
 # Clone or download this project
 cd nexus-ai
 
-# Install dependencies
+# Install dependencies and Playwright browsers
 npm install
+npx playwright install chromium
 
-# Run the setup wizard
+# Run the setup wizard to configure the AI Provider, API keys, and Telegram integration
 npm run setup
 
-# Start Nexus AI
-npm start
+# Start Nexus AI server in development mode
+npm run dev
 ```
 
-The setup wizard will walk you through:
-1. ✅ AI Provider Selection (NVIDIA, Gemini, OpenAI)
-2. 🔌 Platform selection & credentials
-3. 🎙️ Voice configuration
-4. 🧠 AI personality customization
+---
 
-### Access the Dashboard
+## 🎓 Setting Up Cipher (Academic Automation)
 
-Open **http://localhost:3000** in your browser.
+Cipher works in the background to scrape your college portal. To enable it:
+
+1. **Enable Cipher in `.env`**:  
+   Ensure `CIPHER_ENABLED=true` in your `.env` configuration.
+   
+2. **Set Credentials Securely**:  
+   Run the CLI to encrypt and securely store your SSO credentials:
+   ```bash
+   node src/cipher-cli.js set-credentials
+   ```
+   
+3. **Trigger a Manual Scan**:  
+   To test the automation immediately, run a manual scan:
+   ```bash
+   node src/cipher-cli.js scan-now
+   ```
+   *Note: During the scan, it will detect Duo 2FA. Approve the login manually on your phone, and Cipher will automatically detect the approval and continue crawling!*
+
+4. **Ask the AI!**  
+   Once the database is synced, you can go to Telegram and ask:
+   > *"What assignments do I have due this week?"* or *"What was my score on Homework 2?"*
 
 ---
 
-## 📱 Platform Setup
+## 📱 Telegram Integration (Primary UI)
 
-### Telegram
-1. Message [@BotFather](https://t.me/botfather) on Telegram
-2. Send `/newbot` and follow the prompts
-3. Copy the bot token into the setup wizard
-
-### Discord
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
-2. Create a New Application → Bot section → Create Bot
-3. Enable **Message Content Intent** and **Server Members Intent**
-4. Copy the bot token into the setup wizard
-5. Invite the bot to your server using OAuth2 URL Generator (scope: `bot`, permissions: `Send Messages`)
-
-### Slack
-1. Go to [api.slack.com/apps](https://api.slack.com/apps) → Create New App
-2. Enable **Socket Mode** and create an App-Level Token (scope: `connections:write`)
-3. Add Bot Token Scopes: `chat:write`, `app_mentions:read`, `im:history`, `im:read`, `im:write`
-4. Install to workspace and copy both tokens
-
-### WhatsApp
-1. No credentials needed!
-2. When you start Nexus AI, a QR code appears in the terminal
-3. Open WhatsApp → Settings → Linked Devices → Link a Device
-4. Scan the QR code
-
-### iMessage (macOS only)
-1. No credentials needed
-2. Grant **Full Disk Access** to Terminal:
-   - System Preferences → Security & Privacy → Privacy → Full Disk Access
-3. Enable iMessage in the setup wizard
-
----
-
-## 🎙️ Voice
-
-Voice works through the web dashboard:
-- Click the **microphone button** to start recording
-- Your speech is transcribed via OpenAI Whisper
-- The AI response can be read aloud via Text-to-Speech
-
-Voice options: `alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`
+Telegram acts as the main conversational UI for Nexus.
+1. Message [@BotFather](https://t.me/botfather) on Telegram.
+2. Send `/newbot` and follow the prompts to get your Token.
+3. Paste the token during the `npm run setup` wizard, or manually add it to your `.env` as `TELEGRAM_BOT_TOKEN`.
+4. Chat with your bot directly! It knows exactly what tools to use for your college work natively.
 
 ---
 
 ## 🏃 Running in Background
 
-Use PM2 to keep Nexus AI running 24/7:
+Use **PM2** to keep Nexus AI and the Cipher agent running 24/7 so it can scrape deadlines and notify you seamlessly:
 
 ```bash
 # Install PM2 globally
 npm install -g pm2
 
 # Start Nexus AI
-pm2 start ecosystem.config.js
+pm2 start ecosystem.config.cjs
 
 # Monitor
 pm2 monit
@@ -128,47 +111,29 @@ pm2 save
 
 ---
 
-## 📁 Project Structure
+## 📁 System Architecture
 
 ```
 nexus-ai/
 ├── src/
-│   ├── index.js              # Main entry point
-│   ├── wizard.js             # CLI setup wizard
-│   ├── server.js             # Express + WebSocket server
+│   ├── index.js              # Main entry point & Web Dashboard 
+│   ├── cipher-cli.js         # Command line tooling for Academic scanning
 │   ├── core/
-│   │   ├── ai-engine.js      # OpenAI integration
-│   │   ├── database.js       # SQLite storage
-│   │   └── conversation-manager.js
+│   │   ├── ai-engine.js      # Provider Integration (Nvidia NIM, OpenAI)
+│   │   ├── database.js       # Core SQLite database access
+│   │   ├── tools.js          # Definitions for agentic tools (e.g., cipher_list_assignments)
+│   │   ├── portal-navigator.js # Playwright DOM crawling for D2L portals
+│   │   └── cipher-scheduler.js # Background polling loops and deadline logic
 │   └── adapters/
-│       ├── telegram.js       # Telegram bot
-│       ├── discord.js        # Discord bot
-│       ├── slack.js          # Slack app
-│       ├── whatsapp.js       # WhatsApp client
-│       ├── imessage.js       # iMessage (macOS)
-│       └── voice.js          # Voice STT/TTS
-├── public/                   # Web dashboard
-├── config/                   # Default config
-├── data/                     # SQLite DB (auto-created)
-└── ecosystem.config.js       # PM2 config
+│       └── telegram.js       # Telegram integration bridge
+├── data/                     # SQLite database (auto-generated)
+├── .vault/                   # Secure 256-bit encrypted credentials
+├── config/                   
+└── ecosystem.config.cjs      # PM2 layout
 ```
-
----
-
-## ⚙️ Configuration
-
-Edit `.env` directly or re-run `npm run setup`:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AI_PROVIDER` | AI Provider | `openai` (or `gemini`, `nvidia`) |
-| `AI_MODEL` | AI model to use | `gpt-4o-mini` |
-| `PORT` | Web dashboard port | `3000` |
-| `VOICE_ENABLED` | Enable voice features | `true` |
-| `VOICE_NAME` | TTS voice selection | `alloy` |
 
 ---
 
 ## 📄 License
 
-MIT — Use it however you want. Your data, your rules.
+MIT — Use it however you want. All your portal data, chat logs, and grades physically never leave your local machine SQLite database.
