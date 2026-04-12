@@ -1,0 +1,61 @@
+# ==========================================
+# Nexus AI - System Requirements & Packages
+# ==========================================
+# NOTE: Since this is a Node.js project, ALL NPM packages are automatically 
+# installed when you run `npm install`. This file serves as a reference 
+# for the underlying technology stack and required environment.
+
+# --------------------------
+# 1. System Requirements
+# --------------------------
+Node.js (v18.0.0 or higher)
+SQLite3 (Native binaries automatically compiled via better-sqlite3)
+Git
+
+# --------------------------
+# 2. Package Dependencies (automatically installed via npm install)
+# --------------------------
+# --- AI Providers & APIs ---
+openai==4.73.0                  # Core engine for NVIDIA NIM, OpenAI GPT models, Whisper STT, TTS
+@google/generative-ai==0.24.1   # Google Gemini AI integrations
+
+# --- Autonomous Browser / Academic Scraper ---
+playwright==1.59.1              # Headless Chromium for Cipher (D2L extraction, Duo 2FA)
+
+# --- Database & Storage ---
+better-sqlite3==11.7.0          # High-performance local SQLite database engine
+uuid==11.0.0                    # Unique ID generation for conversations and tasks
+
+# --- Integrations & Messaging ---
+node-telegram-bot-api==0.66.0   # Main Telegram bot controller
+discord.js==14.16.0             # Discord client 
+@slack/bolt==4.1.0              # Slack app framework
+whatsapp-web.js==1.26.0         # WhatsApp connection
+qrcode-terminal==0.12.0         # Terminal QR code generation for WhatsApp 
+
+# --- Web Dashboard & CLI ---
+express==4.21.0                 # Dashboard web server
+ws==8.18.0                      # WebSockets for real-time terminal/chat updates
+multer==1.4.5-lts.1             # File upload handling (local attachments)
+inquirer==12.3.0                # Interactive command-line setup wizard (npm run setup)
+chalk==5.3.0                    # Terminal styling
+ora==8.1.0                      # Terminal spinners
+
+# --- Environment & Utils ---
+dotenv==16.4.7                  # Loads configuration from .env file
+pdf-parse==2.4.5                # Extracts text offline from PDF documents
+
+# --------------------------
+# 3. Global Tools (Installed globally)
+# --------------------------
+# To run the bot permanently in the background:
+# npm install -g pm2
+pm2==5.4.0
+
+# --------------------------
+# 4. First-time Setup Instructions
+# --------------------------
+# 1. npm install
+# 2. npx playwright install chromium
+# 3. npm run setup
+# 4. npm run dev
