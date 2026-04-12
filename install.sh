@@ -92,21 +92,76 @@ else
     cd "$INSTALL_DIR"
 fi
 
-# ── Step 3: Install Dependencies ───────────────────────
-step 3 "Installing dependencies..."
+# ── Step 3: Detect System Resources ────────────────────
+step 3 "Detecting system resources..."
 
-npm install --silent 2>&1 | tail -1
+LOW_SPEC=false
+SWAP_CREATED=false
+
+# Detect available RAM (works on both Linux and macOS)
+if [ -f /proc/meminfo ]; then
+    TOTAL_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    TOTAL_RAM_MB=$((TOTAL_RAM_KB / 1024))
+    AVAIL_RAM_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+    AVAIL_RAM_MB=$((AVAIL_RAM_KB / 1024))
+else
+    # macOS fallback
+    TOTAL_RAM_MB=$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))
+    AVAIL_RAM_MB=$TOTAL_RAM_MB
+fi
+
+info "Total RAM: ${TOTAL_RAM_MB}MB | Available: ${AVAIL_RAM_MB}MB"
+
+if [ "$TOTAL_RAM_MB" -lt 2048 ]; then
+    LOW_SPEC=true
+    warn "Low-spec server detected (< 2GB RAM). Enabling memory-safe install mode."
+
+    # Auto-create swap if running as root on Linux and no swap exists
+    CURRENT_SWAP=$(free -m 2>/dev/null | grep Swap | awk '{print $2}' || echo "0")
+    if [ "$CURRENT_SWAP" = "0" ] && [ "$(id -u)" = "0" ] && [ -f /proc/meminfo ]; then
+        info "Creating 1GB swap file for compilation..."
+        dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none 2>/dev/null || true
+        chmod 600 /swapfile 2>/dev/null || true
+        mkswap /swapfile 2>/dev/null | tail -1 || true
+        swapon /swapfile 2>/dev/null || true
+        SWAP_CREATED=true
+        success "Temporary 1GB swap enabled"
+    elif [ "$CURRENT_SWAP" = "0" ] && [ "$(id -u)" != "0" ]; then
+        warn "No swap detected. If install freezes, re-run with: sudo bash install.sh"
+    fi
+fi
+
+# ── Step 4: Install Dependencies ───────────────────────
+step 4 "Installing npm packages..."
+
+if [ "$LOW_SPEC" = true ]; then
+    info "Using low-memory mode: throttled concurrency, capped heap size"
+    export NODE_OPTIONS="--max-old-space-size=256"
+    npm install --maxsockets=2 --no-optional 2>&1 | tail -5
+else
+    npm install 2>&1 | tail -3
+fi
 success "npm packages installed"
 
-# ── Step 4: Install Playwright Browser ─────────────────
-step 4 "Installing Playwright Chromium (for Cipher Academic Agent)..."
+# ── Step 5: Install Playwright (Optional) ──────────────
+step 5 "Installing Playwright Chromium (for Cipher Academic Agent)..."
 
-npx playwright install chromium 2>&1 | tail -3
-success "Playwright Chromium installed"
+if [ "$LOW_SPEC" = true ]; then
+    info "Low-spec mode: skipping Playwright auto-install to save resources."
+    warn "To install Playwright later, run:  npx playwright install chromium"
+else
+    npx playwright install chromium 2>&1 | tail -3
+    success "Playwright Chromium installed"
+fi
 
-# ── Step 5: Done ───────────────────────────────────────
-step 5 "Installation complete!"
+# ── Cleanup Swap ───────────────────────────────────────
+if [ "$SWAP_CREATED" = true ]; then
+    swapoff /swapfile 2>/dev/null || true
+    rm -f /swapfile 2>/dev/null || true
+    info "Temporary swap removed"
+fi
 
+# ── Done ───────────────────────────────────────────────
 echo ""
 echo -e "  ${DIM}─────────────────────────────────────────────────────${NC}"
 echo ""
