@@ -189,41 +189,66 @@ export class PortalNavigator {
         const currentUrl = this.page.url();
         console.log(`  \x1b[35m[Cipher]\x1b[0m Current URL: ${currentUrl}`);
 
-        // The landing page has a LOGIN button — click it to trigger SSO redirect
-        if (!currentUrl.includes('auth.wright.edu')) {
-          console.log(`  \x1b[35m[Cipher]\x1b[0m On landing page — clicking LOGIN button...`);
-
-          // Click the LOGIN button/link
-          const loginBtn = await this.page.$('a:has-text("LOGIN"), button:has-text("LOGIN"), a:has-text("Log In"), a:has-text("Sign In"), .login-btn, a[href*="login"]');
-          if (loginBtn) {
-            await Promise.all([
-              this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
-              loginBtn.click()
-            ]);
-            await this._delay(3000);
-          } else {
-            // Try clicking by text content
-            await Promise.all([
-              this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
-              this.page.click('text=LOGIN').catch(() => this.page.click('text=Log In'))
-            ]);
-            await this._delay(3000);
-          }
-
-          const ssoUrl = this.page.url();
-          console.log(`  \x1b[35m[Cipher]\x1b[0m Redirected to: ${ssoUrl}`);
-        }
-
-        if (ssoConfig.enabled && this.page.url().includes(ssoConfig.redirectDomain || 'auth')) {
-          console.log(`  \x1b[35m[Cipher]\x1b[0m SSO redirect detected → ${ssoConfig.redirectDomain}`);
-        }
-
-        // Wait for the login form on the SSO page
+        // Check if the login form is already present (skip clicking LOGIN button)
         const usernameSelector = selectors.usernameInput || '#username';
         const passwordSelector = selectors.passwordInput || '#password';
         const submitSelector = selectors.submitButton || '#signOnButton';
+        const ssoRedirectDomain = ssoConfig.redirectDomain || '';
 
-        // Wait for username field to be visible on the SSO page
+        const formAlreadyVisible = await this.page.$(usernameSelector).catch(() => null);
+
+        if (formAlreadyVisible) {
+          console.log(`  \x1b[35m[Cipher]\x1b[0m Login form already visible — skipping login button click`);
+        } else if (ssoRedirectDomain && currentUrl.includes(ssoRedirectDomain)) {
+          console.log(`  \x1b[35m[Cipher]\x1b[0m Already on SSO page (${ssoRedirectDomain})`);
+        } else {
+          // Try to find and click a LOGIN button to trigger SSO redirect
+          console.log(`  \x1b[35m[Cipher]\x1b[0m Looking for login button to trigger SSO...`);
+
+          let clicked = false;
+
+          // Strategy 1: Find button/link with login-related text
+          const loginSelectors = [
+            'a:has-text("LOGIN")', 'button:has-text("LOGIN")',
+            'a:has-text("Log In")', 'button:has-text("Log In")',
+            'a:has-text("Sign In")', 'button:has-text("Sign In")',
+            'a:has-text("log in")', 'button:has-text("log in")',
+            '.login-btn', '#login-btn',
+            'a[href*="login"]', 'a[href*="saml"]', 'a[href*="sso"]', 'a[href*="auth"]'
+          ];
+
+          for (const sel of loginSelectors) {
+            try {
+              const btn = await this.page.$(sel);
+              if (btn) {
+                console.log(`  \x1b[35m[Cipher]\x1b[0m Found login trigger: ${sel}`);
+                await Promise.all([
+                  this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+                  btn.click()
+                ]);
+                await this._delay(3000);
+                clicked = true;
+                break;
+              }
+            } catch (e) { continue; }
+          }
+
+          if (!clicked) {
+            // Strategy 2: Maybe the page auto-redirects — just wait a bit
+            console.log(`  \x1b[33m[Cipher]\x1b[0m No login button found — waiting for auto-redirect...`);
+            await this._delay(5000);
+          }
+
+          const ssoUrl = this.page.url();
+          console.log(`  \x1b[35m[Cipher]\x1b[0m Now at: ${ssoUrl}`);
+        }
+
+        if (ssoConfig.enabled && ssoRedirectDomain && this.page.url().includes(ssoRedirectDomain)) {
+          console.log(`  \x1b[35m[Cipher]\x1b[0m SSO redirect detected → ${ssoRedirectDomain}`);
+        }
+
+
+        // Wait for username field to be visible
         await this.page.waitForSelector(usernameSelector, { 
           state: 'visible', 
           timeout: 15000 
