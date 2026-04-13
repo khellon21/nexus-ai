@@ -556,16 +556,25 @@ async function main() {
 
     let preset = platformPresets[portalPlatform] || null;
 
-    // ─── SSO Configuration ──────────────────────────
+    // ─── SSO Configuration (optional) ──────────────────
 
     if (preset) {
-      const { ssoRedirectDomain } = await inquirer.prompt([{
-        type: 'input',
-        name: 'ssoRedirectDomain',
-        message: 'SSO redirect domain (e.g. auth.wright.edu, leave blank if unknown):',
-        default: existingPortalConfig.sso?.redirectDomain || ''
+      const { knowSsoDomain } = await inquirer.prompt([{
+        type: 'confirm',
+        name: 'knowSsoDomain',
+        message: 'Do you know your SSO/authentication redirect domain? (most users: No)',
+        default: false
       }]);
-      preset.sso.redirectDomain = ssoRedirectDomain;
+
+      if (knowSsoDomain) {
+        const { ssoRedirectDomain } = await inquirer.prompt([{
+          type: 'input',
+          name: 'ssoRedirectDomain',
+          message: 'SSO redirect domain (e.g. auth.wright.edu):',
+          default: existingPortalConfig.sso?.redirectDomain || ''
+        }]);
+        preset.sso.redirectDomain = ssoRedirectDomain;
+      }
     }
 
     // ─── Custom Selectors ───────────────────────────
