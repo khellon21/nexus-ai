@@ -2,7 +2,36 @@ import TelegramBot from 'node-telegram-bot-api';
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
-const pdfParse = require('pdf-parse');
+
+// Lazy-load pdf-parse to avoid DOMMatrix crash on Node.js 18
+let pdfParse = null;
+function getPdfParse() {
+  if (!pdfParse) {
+    // Polyfill DOMMatrix for Node.js (required by pdf-parse v2)
+    if (typeof globalThis.DOMMatrix === 'undefined') {
+      globalThis.DOMMatrix = class DOMMatrix {
+        constructor(init) {
+          const values = [1, 0, 0, 1, 0, 0];
+          if (Array.isArray(init)) {
+            for (let i = 0; i < Math.min(init.length, 6); i++) values[i] = init[i];
+          }
+          this.a = values[0]; this.b = values[1];
+          this.c = values[2]; this.d = values[3];
+          this.e = values[4]; this.f = values[5];
+        }
+        isIdentity = true;
+        is2D = true;
+        translate() { return new DOMMatrix(); }
+        scale() { return new DOMMatrix(); }
+        multiply() { return new DOMMatrix(); }
+        inverse() { return new DOMMatrix(); }
+        transformPoint(p) { return p; }
+      };
+    }
+    pdfParse = require('pdf-parse');
+  }
+  return pdfParse;
+}
 
 export class TelegramAdapter {
   constructor(conversationManager) {
@@ -42,7 +71,7 @@ export class TelegramAdapter {
             const buffer = await fileRes.arrayBuffer();
             
             if (msg.document.mime_type === 'application/pdf') {
-              const pdfData = await pdfParse(Buffer.from(buffer));
+              const pdfData = await getPdfParse()(Buffer.from(buffer));
               promptText += `\n\n[User uploaded PDF: ${msg.document.file_name}]\n${pdfData.text.substring(0, 150000)}`;
             } else {
               const textData = Buffer.from(buffer).toString('utf-8');
