@@ -1,7 +1,9 @@
 import inquirer from 'inquirer';
 import chalk from 'chalk';
 import ora from 'ora';
-import { writeFileSync, existsSync, readFileSync } from 'fs';
+import { writeFileSync, existsSync, readFileSync, mkdirSync } from 'fs';
+import { randomBytes } from 'crypto';
+import { dirname } from 'path';
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
@@ -374,9 +376,398 @@ async function main() {
     if (voiceAnswers.voiceName) config.VOICE_NAME = voiceAnswers.voiceName;
   }
 
-  // ─── Step 5: System Prompt ───────────────────────────
+  // ─── Step 5: Cipher Academic Agent ──────────────────
 
-  console.log(chalk.hex('#6C5CE7').bold('\n  ━━━ Step 4: Personality ━━━\n'));
+  console.log(chalk.hex('#FF6B6B').bold('\n  ━━━ Step 4: Cipher — Academic Agent ━━━'));
+  console.log(chalk.gray('  Cipher monitors your college portal for assignments, due dates,'));
+  console.log(chalk.gray('  and grades — then sends alerts to your phone via Telegram.\n'));
+
+  const { enableCipher } = await inquirer.prompt([{
+    type: 'confirm',
+    name: 'enableCipher',
+    message: 'Enable Cipher Academic Agent?',
+    default: existingConfig.CIPHER_ENABLED === 'true' || false
+  }]);
+
+  let cipherConfig = {
+    enabled: false,
+    vaultKey: existingConfig.CIPHER_VAULT_KEY || '',
+    scanInterval: existingConfig.CIPHER_SCAN_INTERVAL || '7200',
+    telegramChatId: existingConfig.CIPHER_TELEGRAM_CHAT_ID || '',
+    alertThresholds: existingConfig.CIPHER_ALERT_THRESHOLDS || '48,24,6,1',
+    summaryHour: existingConfig.CIPHER_SUMMARY_HOUR || '8'
+  };
+
+  let portalJson = null;
+
+  if (enableCipher) {
+    cipherConfig.enabled = true;
+
+    // ─── Portal Platform ────────────────────────────
+
+    console.log(chalk.hex('#FF6B6B').bold('\n  ━━━ College Portal Setup ━━━\n'));
+
+    const { portalPlatform } = await inquirer.prompt([{
+      type: 'list',
+      name: 'portalPlatform',
+      message: 'What platform does your college portal use?',
+      choices: [
+        { name: '📘 D2L Brightspace   (Pilot, MyLS, etc.)', value: 'd2l' },
+        { name: '🟧 Canvas LMS        (Instructure)', value: 'canvas' },
+        { name: '⬛ Blackboard Learn  (Ultra or Classic)', value: 'blackboard' },
+        { name: '🔧 Custom / Other    (I\'ll enter selectors)', value: 'custom' }
+      ]
+    }]);
+
+    // Load existing config if present
+    let existingPortalConfig = {};
+    const portalConfigPath = './config/cipher-portal.json';
+    try {
+      if (existsSync(portalConfigPath)) {
+        existingPortalConfig = JSON.parse(readFileSync(portalConfigPath, 'utf-8'));
+      }
+    } catch (e) { /* ignore */ }
+
+    // ─── Portal URL ─────────────────────────────────
+
+    const { portalUrl } = await inquirer.prompt([{
+      type: 'input',
+      name: 'portalUrl',
+      message: 'College portal URL (e.g. https://pilot.wright.edu):',
+      default: existingPortalConfig.portalUrl || '',
+      validate: (input) => {
+        if (!input.startsWith('https://')) return 'URL must start with https://';
+        return true;
+      }
+    }]);
+
+    // ─── Platform Presets ────────────────────────────
+
+    const platformPresets = {
+      d2l: {
+        loginPage: '/d2l/loginh/',
+        dashboardPage: '/d2l/home',
+        sso: {
+          enabled: true,
+          provider: 'PingFederate / SAML',
+          redirectDomain: '',
+          note: 'Portal redirects to SSO — Cipher handles the redirect automatically'
+        },
+        loginSelectors: {
+          usernameInput: '#username',
+          passwordInput: '#password',
+          submitButton: '#signOnButton',
+          loginSuccessIndicator: 'homepage',
+          loginErrorIndicator: 'invalid'
+        },
+        navigationSelectors: {
+          courseLinks: ".d2l-card a, .course-card a, a[href*='/d2l/home/']",
+          assignmentHub: "a[href*='dropbox'], a[href*='assignments']",
+          courseTitle: '.d2l-page-title, .d2l-heading, h1'
+        },
+        assignmentSelectors: {
+          assignmentList: '.d2l-datalist-item, .d2l-table tr, .assignment-row',
+          assignmentTitle: '.d2l-foldername, .d2l-heading, td:first-child',
+          dueDate: '.d2l-dates, .d2l-textblock, .due-date',
+          description: '.d2l-textblock, .description',
+          dropboxLink: "a[href*='dropbox'], a[href*='submission']",
+          status: '.d2l-submission-status, .status'
+        },
+        submissionSelectors: {
+          fileInput: "input[type='file'], .d2l-file-input",
+          submitButton: "button[primary], .d2l-button-primary, .submit-btn, button[type='submit']",
+          confirmationText: 'submitted successfully',
+          confirmationIndicator: '.d2l-submission-confirmation, .d2l-toast'
+        }
+      },
+      canvas: {
+        loginPage: '/login/canvas',
+        dashboardPage: '/courses',
+        sso: {
+          enabled: true,
+          provider: 'SAML / CAS',
+          redirectDomain: '',
+          note: 'Portal may redirect to institutional SSO'
+        },
+        loginSelectors: {
+          usernameInput: '#pseudonym_session_unique_id',
+          passwordInput: '#pseudonym_session_password',
+          submitButton: '.Button--login',
+          loginSuccessIndicator: 'dashboard',
+          loginErrorIndicator: 'Invalid'
+        },
+        navigationSelectors: {
+          courseLinks: "a.ic-DashboardCard__link, a[href*='/courses/']",
+          assignmentHub: "a[href*='/assignments'], a[href*='/quizzes']",
+          courseTitle: 'h2.course-title, h1'
+        },
+        assignmentSelectors: {
+          assignmentList: '.assignment, .ig-row, tr.assignment',
+          assignmentTitle: '.ig-title a, .assignment-title a',
+          dueDate: '.assignment-date-due, .due_date_display',
+          description: '.description, .user_content',
+          dropboxLink: "a[href*='/assignments/'], a[href*='/submit']",
+          status: '.submission-status, .status'
+        },
+        submissionSelectors: {
+          fileInput: "input[type='file']",
+          submitButton: "button[type='submit'], .submit_assignment_link",
+          confirmationText: 'submitted',
+          confirmationIndicator: '.submission_confirmation'
+        }
+      },
+      blackboard: {
+        loginPage: '/webapps/login/',
+        dashboardPage: '/ultra/course',
+        sso: {
+          enabled: true,
+          provider: 'SAML / Shibboleth',
+          redirectDomain: '',
+          note: 'Portal may redirect to institutional SSO'
+        },
+        loginSelectors: {
+          usernameInput: '#user_id',
+          passwordInput: '#password',
+          submitButton: '#entry-login',
+          loginSuccessIndicator: 'institution',
+          loginErrorIndicator: 'error'
+        },
+        navigationSelectors: {
+          courseLinks: "a[href*='listContent'], a[href*='/ultra/courses']",
+          assignmentHub: "a[href*='assignment'], a[href*='assessment']",
+          courseTitle: '#courseMenu_link, h1'
+        },
+        assignmentSelectors: {
+          assignmentList: '.inventory-item, .element-card, li.clearfix',
+          assignmentTitle: '.element-details h4 a, .inventory-item-title',
+          dueDate: '.element-details .date, .due-date',
+          description: '.vtbegenerated, .details',
+          dropboxLink: "a[href*='assignment'], a[href*='attempt']",
+          status: '.status, .graded-status'
+        },
+        submissionSelectors: {
+          fileInput: "input[type='file']",
+          submitButton: "button[type='submit'], #bottom_Submit",
+          confirmationText: 'submitted',
+          confirmationIndicator: '.receipt'
+        }
+      }
+    };
+
+    let preset = platformPresets[portalPlatform] || null;
+
+    // ─── SSO Configuration ──────────────────────────
+
+    if (preset) {
+      const { ssoRedirectDomain } = await inquirer.prompt([{
+        type: 'input',
+        name: 'ssoRedirectDomain',
+        message: 'SSO redirect domain (e.g. auth.wright.edu, leave blank if unknown):',
+        default: existingPortalConfig.sso?.redirectDomain || ''
+      }]);
+      preset.sso.redirectDomain = ssoRedirectDomain;
+    }
+
+    // ─── Custom Selectors ───────────────────────────
+
+    if (portalPlatform === 'custom') {
+      console.log(chalk.gray('\n  Enter CSS selectors for your portal. Leave defaults if unsure.\n'));
+
+      const customSelectors = await inquirer.prompt([
+        {
+          type: 'input',
+          name: 'loginPage',
+          message: 'Login page path (e.g. /login):',
+          default: existingPortalConfig.loginPage || '/login'
+        },
+        {
+          type: 'input',
+          name: 'dashboardPage',
+          message: 'Dashboard page path (after login):',
+          default: existingPortalConfig.dashboardPage || '/dashboard'
+        },
+        {
+          type: 'input',
+          name: 'usernameInput',
+          message: 'Username input selector:',
+          default: existingPortalConfig.loginSelectors?.usernameInput || '#username'
+        },
+        {
+          type: 'input',
+          name: 'passwordInput',
+          message: 'Password input selector:',
+          default: existingPortalConfig.loginSelectors?.passwordInput || '#password'
+        },
+        {
+          type: 'input',
+          name: 'submitButton',
+          message: 'Login submit button selector:',
+          default: existingPortalConfig.loginSelectors?.submitButton || 'button[type="submit"]'
+        }
+      ]);
+
+      preset = {
+        loginPage: customSelectors.loginPage,
+        dashboardPage: customSelectors.dashboardPage,
+        sso: { enabled: false, provider: 'Custom', redirectDomain: '', note: '' },
+        loginSelectors: {
+          usernameInput: customSelectors.usernameInput,
+          passwordInput: customSelectors.passwordInput,
+          submitButton: customSelectors.submitButton,
+          loginSuccessIndicator: 'dashboard',
+          loginErrorIndicator: 'invalid'
+        },
+        navigationSelectors: {
+          courseLinks: "a[href*='course']",
+          assignmentHub: "a[href*='assignment']",
+          courseTitle: 'h1'
+        },
+        assignmentSelectors: {
+          assignmentList: 'tr, li',
+          assignmentTitle: 'td:first-child a, li a',
+          dueDate: '.due-date, .date',
+          description: '.description',
+          dropboxLink: "a[href*='submit']",
+          status: '.status'
+        },
+        submissionSelectors: {
+          fileInput: "input[type='file']",
+          submitButton: "button[type='submit']",
+          confirmationText: 'submitted',
+          confirmationIndicator: '.confirmation'
+        }
+      };
+    }
+
+    // Build and save cipher-portal.json
+    portalJson = {
+      portalUrl: portalUrl,
+      loginPage: preset.loginPage,
+      dashboardPage: preset.dashboardPage,
+      sso: preset.sso,
+      loginSelectors: preset.loginSelectors,
+      navigationSelectors: preset.navigationSelectors,
+      assignmentSelectors: preset.assignmentSelectors,
+      submissionSelectors: preset.submissionSelectors,
+      navigation: {
+        pageLoadDelayMs: 4000,
+        actionDelayMs: 2000,
+        maxRetries: 3,
+        retryBaseDelayMs: 2000
+      },
+      courses: []
+    };
+
+    // ─── Portal Credentials ─────────────────────────
+
+    console.log(chalk.hex('#FF6B6B').bold('\n  ━━━ Portal Login Credentials ━━━'));
+    console.log(chalk.gray('  Your credentials are encrypted with AES-256-GCM and stored locally.'));
+    console.log(chalk.gray('  They never leave your machine.\n'));
+
+    const { portalUsername } = await inquirer.prompt([{
+      type: 'input',
+      name: 'portalUsername',
+      message: 'Portal username (student ID or email):',
+      validate: (v) => v.trim() ? true : 'Username is required'
+    }]);
+
+    const { portalPassword } = await inquirer.prompt([{
+      type: 'password',
+      name: 'portalPassword',
+      message: 'Portal password:',
+      mask: '•',
+      validate: (v) => v ? true : 'Password is required'
+    }]);
+
+    // Auto-generate vault key if not present
+    if (!cipherConfig.vaultKey) {
+      cipherConfig.vaultKey = randomBytes(32).toString('hex');
+      console.log(chalk.green('  ✓ Generated new vault encryption key'));
+    }
+
+    // Store credentials using CipherVault
+    const spinner = ora('  Encrypting credentials...').start();
+    try {
+      // Set the key in env so CipherVault can use it
+      process.env.CIPHER_VAULT_KEY = cipherConfig.vaultKey;
+
+      const { CipherVault } = await import('./core/cipher-vault.js');
+      const vault = new CipherVault();
+      vault.storeCredentials(portalUsername, portalPassword);
+
+      // Verify round-trip
+      const retrieved = vault.getCredentials();
+      if (retrieved.username === portalUsername) {
+        spinner.succeed(chalk.green('  Credentials encrypted & verified ✓'));
+      } else {
+        spinner.fail(chalk.red('  Credential verification failed'));
+      }
+    } catch (err) {
+      spinner.fail(chalk.red(`  Encryption error: ${err.message}`));
+      console.log(chalk.yellow('  You can set credentials later: npm run cipher -- set-credentials'));
+    }
+
+    // ─── Notification Settings ───────────────────────
+
+    console.log(chalk.hex('#FF6B6B').bold('\n  ━━━ Cipher Notifications ━━━\n'));
+
+    const cipherNotifyAnswers = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'telegramChatId',
+        message: 'Telegram Chat ID for alerts (message @userinfobot to get yours):',
+        default: cipherConfig.telegramChatId || '',
+        validate: (v) => {
+          if (!v.trim()) return 'Chat ID is needed to receive alerts';
+          if (!/^\d+$/.test(v.trim())) return 'Chat ID should be a number';
+          return true;
+        }
+      },
+      {
+        type: 'input',
+        name: 'scanInterval',
+        message: 'Portal scan interval in seconds (default 7200 = 2 hours):',
+        default: cipherConfig.scanInterval,
+        validate: (v) => {
+          const n = parseInt(v);
+          if (isNaN(n) || n < 300) return 'Minimum 300 seconds (5 minutes)';
+          return true;
+        }
+      },
+      {
+        type: 'input',
+        name: 'alertThresholds',
+        message: 'Alert hours before deadline (comma-separated):',
+        default: cipherConfig.alertThresholds
+      },
+      {
+        type: 'input',
+        name: 'summaryHour',
+        message: 'Daily summary notification hour (0-23):',
+        default: cipherConfig.summaryHour,
+        validate: (v) => {
+          const n = parseInt(v);
+          if (isNaN(n) || n < 0 || n > 23) return 'Enter a valid hour (0-23)';
+          return true;
+        }
+      }
+    ]);
+
+    cipherConfig.telegramChatId = cipherNotifyAnswers.telegramChatId;
+    cipherConfig.scanInterval = cipherNotifyAnswers.scanInterval;
+    cipherConfig.alertThresholds = cipherNotifyAnswers.alertThresholds;
+    cipherConfig.summaryHour = cipherNotifyAnswers.summaryHour;
+
+    // Save cipher-portal.json
+    const configDir = './config';
+    if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
+    writeFileSync('./config/cipher-portal.json', JSON.stringify(portalJson, null, 2) + '\n');
+    console.log(chalk.green('\n  ✓ Portal config saved to config/cipher-portal.json'));
+  }
+
+  // ─── Step 6: System Prompt ───────────────────────────
+
+  console.log(chalk.hex('#6C5CE7').bold('\n  ━━━ Step 5: Personality ━━━\n'));
 
   const { customizePrompt } = await inquirer.prompt([{
     type: 'confirm',
@@ -395,7 +786,7 @@ async function main() {
     config.SYSTEM_PROMPT = systemPrompt.trim();
   }
 
-  // ─── Step 6: Port ────────────────────────────────────
+  // ─── Step 7: Port ────────────────────────────────────
 
   const { port } = await inquirer.prompt([{
     type: 'input',
@@ -459,6 +850,15 @@ VOICE_ENABLED=${config.VOICE_ENABLED}
 VOICE_MODEL=${config.VOICE_MODEL}
 VOICE_NAME=${config.VOICE_NAME}
 
+# ═══ Cipher — Academic Automation Agent ═══
+CIPHER_ENABLED=${cipherConfig.enabled ? 'true' : 'false'}
+CIPHER_VAULT_KEY=${cipherConfig.vaultKey}
+CIPHER_SCAN_INTERVAL=${cipherConfig.scanInterval}
+CIPHER_TELEGRAM_CHAT_ID=${cipherConfig.telegramChatId}
+CIPHER_ALERT_THRESHOLDS=${cipherConfig.alertThresholds}
+CIPHER_MACOS_NOTIFICATIONS=true
+CIPHER_SUMMARY_HOUR=${cipherConfig.summaryHour}
+
 # ═══ System Prompt ═══
 SYSTEM_PROMPT=${config.SYSTEM_PROMPT}
 `;
@@ -470,6 +870,8 @@ SYSTEM_PROMPT=${config.SYSTEM_PROMPT}
 
   const providerLabel = config.AI_PROVIDER === 'gemini' 
     ? chalk.hex('#4285F4')('Google Gemini') 
+    : config.AI_PROVIDER === 'nvidia'
+    ? chalk.hex('#76B900')('NVIDIA NIM')
     : chalk.hex('#00B894')('OpenAI');
 
   console.log(`
@@ -485,6 +887,7 @@ SYSTEM_PROMPT=${config.SYSTEM_PROMPT}
     API Keys:
       OpenAI:  ${openaiKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
       Gemini:  ${geminiKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
+      NVIDIA:  ${nvidiaKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
 
     Platforms:
       Telegram: ${config.TELEGRAM_ENABLED === 'true' ? chalk.green('● Enabled') : chalk.gray('○ Disabled')}
@@ -493,11 +896,22 @@ SYSTEM_PROMPT=${config.SYSTEM_PROMPT}
       WhatsApp: ${config.WHATSAPP_ENABLED === 'true' ? chalk.green('● Enabled') : chalk.gray('○ Disabled')}
       iMessage: ${config.IMESSAGE_ENABLED === 'true' ? chalk.green('● Enabled') : chalk.gray('○ Disabled')}
 
+    Cipher Academic Agent:
+      Status:  ${cipherConfig.enabled ? chalk.green('● Enabled') : chalk.gray('○ Disabled')}
+      Portal:  ${portalJson ? chalk.hex('#FF6B6B')(portalJson.portalUrl) : chalk.gray('Not configured')}
+      Alerts:  ${cipherConfig.telegramChatId ? chalk.green('● Chat ID set') : chalk.gray('○ Not set')}
+
   ${chalk.hex('#6C5CE7').bold('Next steps:')}
 
     ${chalk.white('1.')} Start Nexus AI:  ${chalk.hex('#00D2FF')('npm start')}
     ${chalk.white('2.')} Open dashboard:  ${chalk.hex('#00D2FF')(`http://localhost:${config.PORT}`)}
-    ${chalk.white('3.')} Run in background: ${chalk.hex('#00D2FF')('npx pm2 start ecosystem.config.js')}
+    ${chalk.white('3.')} Run in background: ${chalk.hex('#00D2FF')('npx pm2 start ecosystem.config.cjs')}${cipherConfig.enabled ? `
+
+  ${chalk.hex('#FF6B6B').bold('Cipher commands:')}
+
+    ${chalk.white('•')} Manual scan:       ${chalk.hex('#00D2FF')('npm run cipher -- scan-now')}
+    ${chalk.white('•')} List assignments:  ${chalk.hex('#00D2FF')('npm run cipher -- list-assignments')}
+    ${chalk.white('•')} Test notification: ${chalk.hex('#00D2FF')('npm run cipher -- test-notify')}` : ''}
 
   ${chalk.gray('Run "npm run setup" anytime to reconfigure.')}
 `);
