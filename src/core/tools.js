@@ -85,7 +85,7 @@ export const getToolsSchema = (provider) => {
       type: 'function',
       function: {
         name: 'cipher_list_assignments',
-        description: 'Get a list of all mapped college assignments. This includes upcoming homework, past exams, due dates, completion status, evaluation status, and SCORES/GRADES. MUST use this tool whenever the user asks about grades, scores, or assignments.',
+        description: 'Get a list of ALL tracked college assignments (both upcoming and past). The response includes an "allAssignments" array with every assignment\'s title, course, due date, completion status, score, and grade. Search through ALL items in allAssignments to find a specific assignment by name. MUST use this tool whenever the user asks about grades, scores, assignments, homework, quizzes, or exams.',
         parameters: { type: 'object', properties: {} }
       }
     },
@@ -103,6 +103,14 @@ export const getToolsSchema = (provider) => {
           },
           required: ['assignmentId', 'filePath']
         }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'cipher_calendar_info',
+        description: 'Get the calendar sync URL and setup instructions. Returns the ICS feed URL that users can subscribe to in Apple Calendar, Google Calendar, or Outlook to see all their assignment deadlines.',
+        parameters: { type: 'object', properties: {} }
       }
     }
   ];
@@ -161,6 +169,8 @@ export class ToolExecutor {
           return await this.cipherListAssignments();
         case 'cipher_schedule_submission':
           return await this.cipherScheduleSubmission(params.assignmentId, params.filePath, params.scheduledAt);
+        case 'cipher_calendar_info':
+          return await this.cipherCalendarInfo();
         default:
           return JSON.stringify({ error: `Unknown tool: ${name}` });
       }
@@ -309,5 +319,21 @@ export class ToolExecutor {
     } catch (e) {
       return JSON.stringify({ error: `Failed to schedule: ${e.message}` });
     }
+  }
+
+  async cipherCalendarInfo() {
+    console.log(`\x1b[35m  [Cipher Tool] Calendar info requested...\x1b[0m`);
+    const port = process.env.PORT || 3000;
+    const icsUrl = `http://localhost:${port}/api/calendar/assignments.ics`;
+    
+    return JSON.stringify({
+      icsUrl,
+      instructions: {
+        apple: `Open Calendar app → File → New Calendar Subscription → Enter URL: ${icsUrl}`,
+        google: `Open Google Calendar → Settings (gear icon) → Add calendar → From URL → Paste: ${icsUrl}`,
+        outlook: `Open Outlook → Add calendar → Subscribe from web → Paste: ${icsUrl}`
+      },
+      note: 'The ICS feed auto-updates with your latest assignments. Subscribe once and it stays synced.'
+    });
   }
 }

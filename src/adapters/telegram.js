@@ -99,9 +99,16 @@ export class TelegramAdapter {
         }
       });
 
+      let lastConflictWarn = 0;
       this.bot.on('polling_error', (error) => {
         if (error.code === 'ETELEGRAM' && error.response?.statusCode === 409) {
-          console.log('  ⚠ Telegram: Another instance is running');
+          const now = Date.now();
+          if (now - lastConflictWarn > 60000) { // Only warn once per minute
+            lastConflictWarn = now;
+            console.log('  ⚠ Telegram: Another bot instance is polling with this token (409 conflict)');
+          }
+        } else if (error.code !== 'EFATAL') {
+          console.error('  ✗ Telegram polling error:', error.message || error.code);
         }
       });
 

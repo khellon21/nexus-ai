@@ -207,14 +207,16 @@ export class PortalNavigator {
 
           let clicked = false;
 
-          // Strategy 1: Find button/link with login-related text
+          // Strategy 1: Use the SAML SSO login link (Wright State specific)
+          // The landing page has a SAML login link that redirects to auth.wright.edu
           const loginSelectors = [
+            '#samlLoginLinkId',                     // Wright State SAML SSO button (primary)
+            'a[href*="/d2l/lp/auth/saml/login"]',  // SAML login href
+            'a[href*="saml"]', 'a[href*="sso"]', 'a[href*="auth"]',
             'a:has-text("LOGIN")', 'button:has-text("LOGIN")',
             'a:has-text("Log In")', 'button:has-text("Log In")',
             'a:has-text("Sign In")', 'button:has-text("Sign In")',
-            'a:has-text("log in")', 'button:has-text("log in")',
-            '.login-btn', '#login-btn',
-            'a[href*="login"]', 'a[href*="saml"]', 'a[href*="sso"]', 'a[href*="auth"]'
+            '.login-btn', '#login-btn'
           ];
 
           for (const sel of loginSelectors) {
@@ -223,7 +225,7 @@ export class PortalNavigator {
               if (btn) {
                 console.log(`  \x1b[35m[Cipher]\x1b[0m Found login trigger: ${sel}`);
                 await Promise.all([
-                  this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+                  this.page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => {}),
                   btn.click()
                 ]);
                 await this._delay(3000);
@@ -243,8 +245,16 @@ export class PortalNavigator {
           console.log(`  \x1b[35m[Cipher]\x1b[0m Now at: ${ssoUrl}`);
         }
 
-        if (ssoConfig.enabled && ssoRedirectDomain && this.page.url().includes(ssoRedirectDomain)) {
-          console.log(`  \x1b[35m[Cipher]\x1b[0m SSO redirect detected → ${ssoRedirectDomain}`);
+        // Check if we landed on the SSO page
+        const postClickUrl = this.page.url();
+        if (postClickUrl.includes('auth.wright.edu') || (ssoConfig.enabled && ssoRedirectDomain && postClickUrl.includes(ssoRedirectDomain))) {
+          console.log(`  \x1b[35m[Cipher]\x1b[0m SSO redirect detected → ${postClickUrl}`);
+        } else if (postClickUrl.includes('noredirect') || postClickUrl.includes('/d2l/login')) {
+          // We landed on the native D2L login — NOT the SSO page. Re-navigate via SAML.
+          console.log(`  \x1b[33m[Cipher]\x1b[0m Landed on native D2L login instead of SSO. Forcing SAML redirect...`);
+          await this._navigate(`${portalUrl}/d2l/lp/auth/saml/login`);
+          await this._delay(3000);
+          console.log(`  \x1b[35m[Cipher]\x1b[0m Now at: ${this.page.url()}`);
         }
 
 
@@ -518,7 +528,7 @@ export class PortalNavigator {
                 title: title,
                 description: text,
                 dueDateStr: dueDateStr,
-                dropboxUrl: link.href || null,
+                dropboxUrl: link ? link.href : null,
                 status: 'pending',
                 completionStatus: completionStatus,
                 score: score,
@@ -531,9 +541,123 @@ export class PortalNavigator {
 
           // DEBUG LOG
           for (const a of courseAssignments) {
-             if (a.title.includes('Quiz-1')) {
-                console.log(`\n  \x1b[36m[Cipher DEBUG]\x1b[0m Quiz-1 text content: "${a.debugText}"\n`);
+             if (a.debugText) {
+                console.log(`  \x1b[36m[Cipher DEBUG]\x1b[0m Row: "${a.title}" | date: ${a.dueDateStr || 'none'}`);
              }
+          }
+
+          // ─── Folder Drill-Down ──────────────────────────
+          // D2L Dropbox pages can organize assignments inside folders.
+          // Detect folder links and click into each to extract sub-assignments.
+          // Guard against infinite loops by tracking visited URLs and limiting depth.
+          try {
+            const folderLinks = await this.page.$$eval(
+              'a[href*="/d2l/lms/dropbox/user/folder_user_view"], th a[href*="/d2l/lms/dropbox/"]',
+              links => links.map(a => ({ href: a.href, text: a.textContent.trim() }))
+                .filter(l => l.text && !l.text.toLowerCase().includes('no category'))
+            ).catch(() => []);
+
+            const currentPageUrl = this.page.url();
+            const visitedUrls = new Set([currentPageUrl]);
+            // Skip D2L status labels and nav elements that aren't real assignment folders
+            const skipNames = [
+              'dropbox', 'results per page', 'folder', 'sort', 'name', 'score',
+              'unread', 'read', 'not submitted', 'feedback', 'evaluation status',
+              'completion', 'due date', 'end date'
+            ];
+            const skipPatterns = [
+              /^\d+\s+submission/i,   // "1 Submission, 1 File"
+              /^\d+\s+file/i,         // "2 Files"  
+              /^feedback:/i,          // "Feedback: Unread"
+              /^\d+\s*\/\s*\d+/,      // Score patterns like "7 / 11"
+              /^-\s*\/\s*\d+/,        // Score patterns like "- / 5"
+              /^\d+\.\d+\s*%/         // Percentage patterns
+            ];
+            const MAX_FOLDERS = 10;
+            let foldersVisited = 0;
+
+            for (const folder of folderLinks) {
+              if (foldersVisited >= MAX_FOLDERS) break;
+
+              // Skip generic/nav links
+              const lowerText = folder.text.toLowerCase().trim();
+              if (skipNames.includes(lowerText)) continue;
+              if (skipPatterns.some(p => p.test(folder.text.trim()))) continue;
+
+              // Skip if we already visited this URL
+              if (visitedUrls.has(folder.href)) continue;
+              visitedUrls.add(folder.href);
+
+              // Skip if we already extracted this as an assignment with a due date
+              const alreadyExtracted = courseAssignments.some(a => a.title === folder.text && a.dueDateStr);
+              if (alreadyExtracted) continue;
+
+              try {
+                foldersVisited++;
+                console.log(`  \x1b[35m[Cipher]\x1b[0m Drilling into folder: ${folder.text}`);
+                await this._navigate(folder.href);
+                await this._delay(2000);
+
+                // Extract sub-assignments from inside the folder
+                const subAssignments = await this.page.$$eval('tr, d2l-table-row, [role="row"], li.d2l-datalist-item', rows => {
+                  const results = [];
+                  for (const row of rows) {
+                    const cells = row.querySelectorAll('th, td, d2l-td, [role="cell"]');
+                    if (cells.length < 2) continue;
+                    const firstCell = cells[0];
+                    const link = firstCell.querySelector('a');
+                    const titleEl = link || firstCell.querySelector('strong, label, div') || firstCell;
+                    const title = titleEl.textContent.trim();
+                    if (!title || title.toLowerCase() === 'folder' || title === 'No Category') continue;
+
+                    const text = row.textContent.replace(/\s+/g, ' ').trim();
+                    const dateMatch = text.match(/(?:due on|due|deadline):?\s*([a-z]+ \d{1,2}, \d{4} \d{1,2}:\d{2} [ap]m)/i) ||
+                                      text.match(/(?:due on|due|deadline):?\s*([a-z]+ \d{1,2}, \d{4})/i);
+                    let completionMatch = text.match(/(Not Submitted|\d+ Submission, \d+ File(?:s?))/i);
+                    let scoreMatch = text.match(/(- \/ \d+|\d+ \/ \d+\s*(?:-\s*\d+(?:\.\d+)?\s*%)?)/i);
+                    let evalMatch = text.match(/Feedback:\s*(Unread|Read)/i);
+                    let completionStatus = completionMatch ? completionMatch[1] : '';
+                    let score = scoreMatch ? scoreMatch[1] : '';
+                    let evaluationStatus = evalMatch ? evalMatch[0] : '';
+
+                    if (cells.length >= 3) {
+                      const cell1 = cells[1].textContent.replace(/\s+/g, ' ').trim();
+                      const cell2 = cells[2] ? cells[2].textContent.replace(/\s+/g, ' ').trim() : '';
+                      const cell3 = cells[3] ? cells[3].textContent.replace(/\s+/g, ' ').trim() : '';
+                      if (!completionStatus && cell1) completionStatus = cell1;
+                      if (!score && cell2 && cell2.includes('/')) score = cell2;
+                      if (!evaluationStatus && cell3) evaluationStatus = cell3;
+                    }
+
+                    results.push({
+                      title: title,
+                      description: text,
+                      dueDateStr: dateMatch ? dateMatch[1] : null,
+                      dropboxUrl: link ? link.href : null,
+                      status: 'pending',
+                      completionStatus, score, evaluationStatus,
+                      debugText: text
+                    });
+                  }
+                  return results;
+                }).catch(() => []);
+
+                if (subAssignments.length > 0) {
+                  console.log(`  \x1b[32m[Cipher]\x1b[0m Found ${subAssignments.length} sub-assignments in folder "${folder.text}"`);
+                  courseAssignments.push(...subAssignments);
+                }
+              } catch (folderErr) {
+                console.log(`  \x1b[33m[Cipher]\x1b[0m Could not drill into folder "${folder.text}": ${folderErr.message}`);
+              }
+            }
+
+            // Navigate back to the course dropbox page for the next folder/course
+            if (foldersVisited > 0) {
+              await this._navigate(currentPageUrl);
+              await this._delay(1000);
+            }
+          } catch (drillErr) {
+            console.log(`  \x1b[33m[Cipher]\x1b[0m Folder drill-down skipped: ${drillErr.message}`);
           }
 
           // Fallback to text parser if table parsing fails

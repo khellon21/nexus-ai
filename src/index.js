@@ -8,6 +8,7 @@ import { SlackAdapter } from './adapters/slack.js';
 import { WhatsAppAdapter } from './adapters/whatsapp.js';
 import { IMessageAdapter } from './adapters/imessage.js';
 import { VoiceAdapter } from './adapters/voice.js';
+import { CalendarAdapter } from './adapters/calendar.js';
 import { createWebServer } from './server.js';
 import { existsSync } from 'fs';
 
@@ -152,7 +153,13 @@ async function main() {
   // ─── Start Web Server ────────────────────────────────
   const port = parseInt(process.env.PORT) || 3000;
 
-  const { server } = createWebServer(cm, voice, () => adapterStatus);
+  // Initialize Calendar Sync
+  const calendar = new CalendarAdapter({ database: db });
+  if (calendar.googleEnabled) {
+    await calendar.initializeGoogle();
+  }
+
+  const { server } = createWebServer(cm, voice, () => adapterStatus, calendar);
 
   server.listen(port, () => {
     console.log(`\n  ┌─────────────────────────────────────────────┐`);

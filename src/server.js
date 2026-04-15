@@ -8,7 +8,7 @@ import multer from 'multer';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-export function createWebServer(conversationManager, voiceAdapter, adapterStatuses) {
+export function createWebServer(conversationManager, voiceAdapter, adapterStatuses, calendarAdapter = null) {
   const app = express();
   const server = createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -152,6 +152,12 @@ export function createWebServer(conversationManager, voiceAdapter, adapterStatus
       res.status(500).json({ error: error.message });
     }
   });
+
+  // ─── Calendar Sync ────────────────────────────────────
+
+  if (calendarAdapter) {
+    calendarAdapter.registerRoutes(app);
+  }
 
   // ─── WebSocket (streaming chat) ────────────────────────
 

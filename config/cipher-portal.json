@@ -2,14 +2,12 @@
   "portalUrl": "https://pilot.wright.edu",
   "loginPage": "/d2l/loginh/",
   "dashboardPage": "/d2l/home",
-
   "sso": {
     "enabled": true,
-    "provider": "PingFederate",
-    "redirectDomain": "auth.wright.edu",
-    "note": "Portal redirects to auth.wright.edu SSO — Cipher handles the redirect automatically"
+    "provider": "PingFederate / SAML",
+    "redirectDomain": "",
+    "note": "Portal redirects to SSO — Cipher handles the redirect automatically"
   },
-
   "loginSelectors": {
     "usernameInput": "#username",
     "passwordInput": "#password",
@@ -17,13 +15,11 @@
     "loginSuccessIndicator": "homepage",
     "loginErrorIndicator": "invalid"
   },
-
   "navigationSelectors": {
     "courseLinks": ".d2l-card a, .course-card a, a[href*='/d2l/home/']",
     "assignmentHub": "a[href*='dropbox'], a[href*='assignments']",
     "courseTitle": ".d2l-page-title, .d2l-heading, h1"
   },
-
   "assignmentSelectors": {
     "assignmentList": ".d2l-datalist-item, .d2l-table tr, .assignment-row",
     "assignmentTitle": ".d2l-foldername, .d2l-heading, td:first-child",
@@ -32,20 +28,17 @@
     "dropboxLink": "a[href*='dropbox'], a[href*='submission']",
     "status": ".d2l-submission-status, .status"
   },
-
   "submissionSelectors": {
     "fileInput": "input[type='file'], .d2l-file-input",
     "submitButton": "button[primary], .d2l-button-primary, .submit-btn, button[type='submit']",
     "confirmationText": "submitted successfully",
     "confirmationIndicator": ".d2l-submission-confirmation, .d2l-toast"
   },
-
   "navigation": {
     "pageLoadDelayMs": 4000,
     "actionDelayMs": 2000,
     "maxRetries": 3,
     "retryBaseDelayMs": 2000
   },
-
   "courses": []
 }

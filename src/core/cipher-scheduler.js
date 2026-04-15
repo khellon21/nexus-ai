@@ -73,8 +73,19 @@ export class CipherScheduler {
     console.log(`  \x1b[35m[Cipher]\x1b[0m   Alert thresholds: ${this.alertThresholds.join('h, ')}h`);
     console.log(`  \x1b[35m[Cipher]\x1b[0m   Daily summary at: ${this.dailySummaryHour}:00`);
 
-    // 1. Portal scan — first run after 30s, then on interval
-    setTimeout(() => this._safeRun('scan', () => this.runScan()), 30000);
+    // 1. Portal scan — only scan on startup if data is stale or missing
+    const existingAssignments = this.db ? (this.db.getAllAssignments ? this.db.getAllAssignments() : []) : [];
+    const lastScanLog = this.db ? this._getLastScanTime() : null;
+    const dataAge = lastScanLog ? (Date.now() - new Date(lastScanLog).getTime()) : Infinity;
+    const dataIsFresh = existingAssignments.length > 0 && dataAge < this.scanIntervalMs;
+
+    if (dataIsFresh) {
+      console.log(`  \x1b[32m[Cipher]\x1b[0m Skipping startup scan — ${existingAssignments.length} assignments in DB (last scan ${Math.round(dataAge / 60000)} min ago)`);
+    } else {
+      const reason = existingAssignments.length === 0 ? 'no assignments in DB' : `data is ${Math.round(dataAge / 60000)} min old`;
+      console.log(`  \x1b[35m[Cipher]\x1b[0m Will scan in 30s (${reason})`);
+      setTimeout(() => this._safeRun('scan', () => this.runScan()), 30000);
+    }
     this.scanTimer = setInterval(() => this._safeRun('scan', () => this.runScan()), this.scanIntervalMs);
 
     // 2. Submission queue — check every 5 minutes
@@ -291,14 +302,13 @@ export class CipherScheduler {
 
   /**
    * Get current assignment status for AI tool response.
+   * Returns ALL assignments (past and upcoming) in a flat list so the AI can search by name.
    */
   getAssignmentStatus() {
     if (!this.db) return { assignments: [], error: 'Database not available' };
 
     const allAssignments = this.db.getAllAssignments ? this.db.getAllAssignments() : [];
-    const upcoming = allAssignments.filter(a => new Date(a.due_date) >= new Date())
-      .sort((a, b) => new Date(a.due_date) - new Date(b.due_date));
-    const completedOrPast = allAssignments.filter(a => new Date(a.due_date) < new Date());
+    const now = new Date();
 
     const formatAssignment = (a) => {
       const dueDateObj = new Date(a.due_date);
@@ -306,30 +316,43 @@ export class CipherScheduler {
       const timeOptions = { hour: 'numeric', minute: '2-digit', hour12: true };
       const formattedDate = dueDateObj.toLocaleDateString('en-US', dateOptions);
       const formattedTime = dueDateObj.toLocaleTimeString('en-US', timeOptions);
+      const hoursLeft = (dueDateObj - now) / (1000 * 60 * 60);
+      const isUpcoming = hoursLeft > 0;
+      const isPastDue = hoursLeft <= 0;
       
       let semester = "Current Semester";
-      if (a.course_name.includes("Spring") || a.course_name.includes("Fall") || a.course_name.includes("Summer")) {
+      if (a.course_name && (a.course_name.includes("Spring") || a.course_name.includes("Fall") || a.course_name.includes("Summer"))) {
         semester = a.course_name.split(' ')[0] + " " + a.course_name.split(' ')[1];
       }
 
       return {
+        id: a.id,
         title: a.title,
         course: a.course_name,
         dueDate: a.due_date,
+        formattedDue: `${formattedDate} at ${formattedTime}`,
+        isUpcoming,
+        isPastDue,
+        hoursLeft: isUpcoming ? Math.round(hoursLeft * 10) / 10 : 0,
         status: a.status,
         completionStatus: a.completion_status || 'Not Submitted',
         score: a.score || 'N/A',
         evaluationStatus: a.evaluation_status || 'N/A',
-        displayString: `${a.course_name}, ${semester}, Ends ${formattedDate} at ${formattedTime}`
+        displayString: `${a.title} — ${a.course_name || 'Unknown Course'}, ${semester}, Due ${formattedDate} at ${formattedTime}`
       };
     };
+
+    const all = allAssignments.map(formatAssignment);
+    const upcoming = all.filter(a => a.isUpcoming).sort((a, b) => a.hoursLeft - b.hoursLeft);
+    const past = all.filter(a => a.isPastDue);
 
     return {
       total: allAssignments.length,
       upcomingCount: upcoming.length,
-      pastCount: completedOrPast.length,
-      upcoming: upcoming.map(formatAssignment),
-      pastAndCompleted: completedOrPast.map(formatAssignment)
+      pastCount: past.length,
+      allAssignments: all,
+      upcoming,
+      pastAndCompleted: past
     };
   }
 
@@ -342,6 +365,21 @@ export class CipherScheduler {
       } catch (e) {
         // Non-critical
       }
+    }
+  }
+
+  /**
+   * Get the timestamp of the last successful scan from the audit log.
+   */
+  _getLastScanTime() {
+    if (!this.db) return null;
+    try {
+      const log = this.db.db.prepare(
+        "SELECT created_at FROM cipher_audit_log WHERE event_type = 'scan_complete' ORDER BY created_at DESC LIMIT 1"
+      ).get();
+      return log ? log.created_at : null;
+    } catch (e) {
+      return null;
     }
   }
 }
