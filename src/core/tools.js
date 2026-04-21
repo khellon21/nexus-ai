@@ -720,7 +720,7 @@ export class ToolExecutor {
 
     try {
       const results = await Promise.race([
-        search(query, { safeSearch: 'off' }),
+        search(query, { safeSearch: -2 }), // SafeSearchType.OFF = -2
         timeout,
       ]);
       const topResults = (results.noResults ? [] : results.results.slice(0, 5)).map(r => ({
