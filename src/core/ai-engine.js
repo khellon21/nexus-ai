@@ -711,6 +711,11 @@ export class AIEngine extends EventEmitter {
         body: form
       });
     } catch (err) {
+      // Connection failed — the child may have died between our health ping
+      // and this request (e.g. a VoxCPM import segfault). Tell the manager
+      // so the next call triggers a fresh cold-start instead of hitting the
+      // same corpse again.
+      await this._reportVoiceFetchFailure(err);
       throw new Error(`Voice service unreachable at ${baseUrl}. ` +
         `Start it with: \`python services/tts/server.py\`. (${err.message})`);
     }
@@ -752,6 +757,7 @@ export class AIEngine extends EventEmitter {
         })
       });
     } catch (err) {
+      await this._reportVoiceFetchFailure(err);
       throw new Error(`Voice service unreachable at ${baseUrl}. ` +
         `Start it with: \`python services/tts/server.py\`. (${err.message})`);
     }
@@ -764,6 +770,26 @@ export class AIEngine extends EventEmitter {
     const arrayBuf = await resp.arrayBuffer();
     this.voiceManager?.markActivity?.();
     return Buffer.from(arrayBuf);
+  }
+
+  /**
+   * Self-healing hook: when a voice fetch fails mid-session (ECONNREFUSED,
+   * connection reset, etc.), ask the manager to tear down whatever corpse
+   * is still on file so the next ensureAwake() respawns cleanly instead
+   * of assuming the process is still healthy. No-op without a manager.
+   */
+  async _reportVoiceFetchFailure(err) {
+    const mgr = this.voiceManager;
+    if (!mgr) return;
+    // Only bother killing if we still think the child is alive — otherwise
+    // the manager already knows and the next ensureAwake will respawn.
+    if (mgr.isRunning) {
+      try {
+        await mgr.shutdown({ reason: 'fetch-failed' });
+        // Allow a fresh cold start next time.
+        mgr._shuttingDown = false;
+      } catch { /* best-effort */ }
+    }
   }
 
   /**
