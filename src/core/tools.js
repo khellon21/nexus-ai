@@ -9,7 +9,7 @@ import os from 'os';
 import { exec } from 'child_process';
 import util from 'util';
 import simpleGit from 'simple-git';
-import { search } from 'duck-duck-scrape';
+import { search, SafeSearchType } from 'duck-duck-scrape';
 
 const execAsync = util.promisify(exec);
 
@@ -714,26 +714,107 @@ export class ToolExecutor {
     }
     console.log(`\x1b[36m  [Tool] Searching internet: ${query}\x1b[0m`);
 
-    // Bound the search call itself — duck-duck-scrape occasionally hangs.
-    const timeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Search timed out')), SEARCH_TIMEOUT_MS));
-
-    try {
-      const results = await Promise.race([
-        search(query, { safeSearch: -2 }), // SafeSearchType.OFF = -2
+    // ── Primary: duck-duck-scrape JSON endpoint ──
+    const runDDS = () => {
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Search timed out')), SEARCH_TIMEOUT_MS));
+      return Promise.race([
+        // NOTE: SafeSearchType is an enum — passing the raw string 'off' makes
+        // duck-duck-scrape's sanityCheck throw before any request goes out.
+        search(query, { safeSearch: SafeSearchType.OFF }),
         timeout,
       ]);
+    };
+
+    let primaryErr = null;
+    try {
+      const results = await runDDS();
       const topResults = (results.noResults ? [] : results.results.slice(0, 5)).map(r => ({
         title: r.title,
         url: r.url,
         description: (r.description || '').slice(0, SEARCH_SNIPPET_MAX_CHARS),
       }));
+      if (topResults.length) {
+        return JSON.stringify({ results: topResults, message: 'Success' });
+      }
+      // Fall through to HTML fallback if we got nothing back.
+      primaryErr = new Error('No results');
+    } catch (e) {
+      primaryErr = e;
+    }
+
+    // ── Fallback: plain HTML scraping (no VQD token required) ──
+    try {
+      const htmlResults = await this._searchInternetHtmlFallback(query);
+      if (htmlResults.length) {
+        return JSON.stringify({
+          results: htmlResults,
+          message: 'Success (via HTML fallback)',
+        });
+      }
       return JSON.stringify({
-        results: topResults,
-        message: topResults.length ? 'Success' : 'No results found',
+        results: [],
+        message: 'No results found',
       });
     } catch (e) {
-      return JSON.stringify({ error: `Search failed: ${e.message}` });
+      return JSON.stringify({
+        error: `Search failed: ${primaryErr?.message || 'unknown'} / fallback: ${e.message}`,
+        hint: 'DuckDuckGo scraping is best-effort; both the JSON VQD endpoint and the HTML endpoint failed. Try again shortly or rephrase the query.',
+      });
+    }
+  }
+
+  /**
+   * Minimal HTML-endpoint scraper used as a fallback when the primary
+   * duck-duck-scrape JSON path fails (VQD token errors, rate limiting, etc.).
+   * No external dependency — just fetch + regex on the results page.
+   */
+  async _searchInternetHtmlFallback(query) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), SEARCH_TIMEOUT_MS);
+    try {
+      const url = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query);
+      const res = await fetch(url, {
+        signal: ctl.signal,
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0',
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const html = await res.text();
+
+      // Parse result blocks. DDG's HTML layout: each result has
+      //   <a class="result__a" href="...">Title</a>
+      //   ...<a class="result__snippet" ...>Snippet text</a>
+      const results = [];
+      const blockRe =
+        /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
+      const stripTags = (s) => s.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+      const decode = (s) =>
+        s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+         .replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&#39;/g, "'");
+
+      let match;
+      while ((match = blockRe.exec(html)) && results.length < 5) {
+        let href = decode(match[1]);
+        // DDG wraps URLs in a redirect: //duckduckgo.com/l/?uddg=<encoded>&rut=...
+        const uddg = href.match(/[?&]uddg=([^&]+)/);
+        if (uddg) {
+          try { href = decodeURIComponent(uddg[1]); } catch { /* keep raw */ }
+        }
+        if (href.startsWith('//')) href = 'https:' + href;
+        const title = decode(stripTags(match[2]));
+        const snippet = decode(stripTags(match[3])).slice(0, SEARCH_SNIPPET_MAX_CHARS);
+        if (title && href) {
+          results.push({ title, url: href, description: snippet });
+        }
+      }
+      return results;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

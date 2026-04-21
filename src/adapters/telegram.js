@@ -150,34 +150,59 @@ export class TelegramAdapter {
         const replyText = response?.content?.trim();
         if (!replyText) return;
 
-        // ─── Epic 4: Voice-Out path ────────────────────────────
+        // ─── Epic 4 + latency mitigation: Send text FIRST, audio later ──
+        //
+        // Perceived-latency rule: the moment we have text, ship it. TTS is
+        // expensive (cold-start adds seconds); waiting for it to finish
+        // would feel sluggish. So we:
+        //   1) Send the text reply immediately.
+        //   2) If the voice engine is asleep, post a brief "waking up" notice
+        //      so the user knows audio is on the way and doesn't retype.
+        //   3) Generate TTS and send it as a voice note when ready. Any TTS
+        //      failure is non-fatal — the user already has the text.
         if (replyAsVoice) {
+          // 1) Text first — shipped before any TTS wait.
+          const textSendPromise = this.bot.sendMessage(chatId, replyText).catch((e) =>
+            console.error('Text pre-send failed:', e.message)
+          );
+
+          // 2) Cold-start notice (don't block on it). The manager is injected
+          //    by src/index.js via globalThis so we don't have to thread it
+          //    through every adapter constructor.
+          const voiceMgr = globalThis.__voiceManager;
+          const wasAsleep = voiceMgr ? !voiceMgr.isRunning : false;
+          if (wasAsleep) {
+            this.bot.sendMessage(
+              chatId,
+              '🎙️ Waking up voice engine, audio reply coming in a few seconds…'
+            ).catch(() => { /* non-critical */ });
+          }
+
+          // 3) Wait for the text send to land, then produce and send audio.
+          //    We await the text to avoid racing two messages for the same
+          //    chat — ordering matters on the client side.
+          await textSendPromise;
           try {
             this.bot.sendChatAction(chatId, 'record_voice');
             const wavBuf = await this.ai.textToSpeech(replyText);
-
-            // `sendVoice` accepts a Buffer directly. Telegram clients prefer
-            // OGG/Opus for the voice-note UI, but they will still play WAV;
-            // if you want the proper waveform bubble, add an ffmpeg transcode
-            // step inside services/tts/server.py that returns OGG/Opus.
             await this.bot.sendVoice(chatId, wavBuf, {}, {
               filename: 'reply.wav',
               contentType: 'audio/wav'
             });
-            return;
           } catch (err) {
             console.error('Voice-out error:', err.message);
-            // Graceful fallback: send the text so the user still gets the reply.
+            // Text has already been delivered; append a tiny note so the
+            // user knows why the voice bubble never arrived.
             await this.bot.sendMessage(
               chatId,
-              `${replyText}\n\n_(voice synthesis failed: ${err.message})_`,
+              `_(voice synthesis failed: ${err.message})_`,
               { parse_mode: 'Markdown' }
-            );
-            return;
+            ).catch(() => { /* best-effort */ });
           }
+          return;
         }
 
-        // ─── Text reply (original behaviour) ───────────────────
+        // ─── Text-only reply (original behaviour) ──────────────
         await this.bot.sendMessage(chatId, replyText);
       });
 

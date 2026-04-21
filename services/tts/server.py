@@ -23,11 +23,13 @@ Run
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import sys
 import logging
 import tempfile
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -54,44 +56,87 @@ log = logging.getLogger("nexus-voice")
 
 # Lazy-initialized singletons — populated on first use so that, e.g.,
 # a broken VoxCPM install does not block Whisper startup.
+#
+# CRITICAL: do NOT construct these at module import time. The Node.js
+# VoiceProcessManager polls /health after spawning us; until uvicorn has
+# bound the port, it thinks we're still cold-starting. Heavy constructors
+# at import time would delay the bind by tens of seconds. Instead we:
+#   • Bind the port instantly (empty lifespan).
+#   • Kick off model loads on a background thread at startup (non-blocking).
+#   • Have request handlers wait on that background load if it's still in
+#     flight rather than starting their own.
 _whisper_model = None
 _voxcpm_model = None
 
+# Locks so only one background thread / request ever attempts a load.
+_whisper_lock = threading.Lock()
+_voxcpm_lock = threading.Lock()
+
+# Background-preload thread handle (so /health can report progress).
+_preload_thread: Optional[threading.Thread] = None
+
 
 # ───────────────────────────────────────────────────────────────
-# Model loaders
+# Model loaders (blocking — call from a worker thread, not the event loop)
 # ───────────────────────────────────────────────────────────────
-def get_whisper():
-    """Lazy-load the Faster-Whisper model once."""
+def _load_whisper_blocking():
+    """Load Faster-Whisper once. Safe to call from multiple threads."""
     global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel  # local import to keep startup cheap
-        log.info(
-            "Loading Faster-Whisper model=%s device=%s compute_type=%s",
-            WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE,
-        )
-        _whisper_model = WhisperModel(
-            WHISPER_MODEL,
-            device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE,
-        )
-        log.info("Faster-Whisper ready.")
+    if _whisper_model is not None:
+        return _whisper_model
+    with _whisper_lock:
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel  # local import to keep import time cheap
+            log.info(
+                "Loading Faster-Whisper model=%s device=%s compute_type=%s",
+                WHISPER_MODEL, WHISPER_DEVICE, WHISPER_COMPUTE,
+            )
+            _whisper_model = WhisperModel(
+                WHISPER_MODEL,
+                device=WHISPER_DEVICE,
+                compute_type=WHISPER_COMPUTE,
+            )
+            log.info("Faster-Whisper ready.")
     return _whisper_model
 
 
-def get_voxcpm():
-    """Lazy-load the VoxCPM2 model once.
-
-    VoxCPM2 is heavy on CPU-only hardware. We load the denoiser only if
-    explicitly requested (VOXCPM_LOAD_DENOISER=true) to save RAM.
-    """
+def _load_voxcpm_blocking():
+    """Load VoxCPM2 once. Heavy on CPU-only hardware."""
     global _voxcpm_model
-    if _voxcpm_model is None:
-        from voxcpm import VoxCPM  # local import — optional at startup
-        log.info("Loading VoxCPM2 model=%s (load_denoiser=%s)", VOXCPM_MODEL, VOXCPM_DENOISE)
-        _voxcpm_model = VoxCPM.from_pretrained(VOXCPM_MODEL, load_denoiser=VOXCPM_DENOISE)
-        log.info("VoxCPM2 ready.")
+    if _voxcpm_model is not None:
+        return _voxcpm_model
+    with _voxcpm_lock:
+        if _voxcpm_model is None:
+            from voxcpm import VoxCPM  # local import — optional at startup
+            log.info("Loading VoxCPM2 model=%s (load_denoiser=%s)", VOXCPM_MODEL, VOXCPM_DENOISE)
+            _voxcpm_model = VoxCPM.from_pretrained(VOXCPM_MODEL, load_denoiser=VOXCPM_DENOISE)
+            log.info("VoxCPM2 ready.")
     return _voxcpm_model
+
+
+async def get_whisper():
+    """Await Whisper readiness without blocking the event loop."""
+    if _whisper_model is not None:
+        return _whisper_model
+    return await asyncio.to_thread(_load_whisper_blocking)
+
+
+async def get_voxcpm():
+    """Await VoxCPM readiness without blocking the event loop."""
+    if _voxcpm_model is not None:
+        return _voxcpm_model
+    return await asyncio.to_thread(_load_voxcpm_blocking)
+
+
+def _preload_models_in_background():
+    """Fire-and-forget preload. Runs on a plain thread so uvicorn's event
+    loop stays free to serve /health immediately."""
+    try:
+        _load_whisper_blocking()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Background Whisper preload failed — will retry on first /transcribe: %s", exc)
+    # Deliberately DO NOT preload VoxCPM here — it's large and often unused.
+    # The TTS endpoint will load it lazily on first /generate.
 
 
 # ───────────────────────────────────────────────────────────────
@@ -99,12 +144,24 @@ def get_voxcpm():
 # ───────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Warm Whisper at boot (fast, always needed). Leave VoxCPM lazy."""
+    """Bind the port IMMEDIATELY, then warm models on a background thread.
+
+    The Node.js VoiceProcessManager considers the service "awake" the
+    moment /health returns 200, so this hook must not block. Heavy model
+    construction happens off-thread so the event loop is free from the
+    first tick.
+    """
+    global _preload_thread
     if os.environ.get("PRELOAD_WHISPER", "true").lower() == "true":
-        try:
-            get_whisper()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Whisper preload failed — will retry on first request: %s", exc)
+        _preload_thread = threading.Thread(
+            target=_preload_models_in_background,
+            name="nexus-voice-preload",
+            daemon=True,
+        )
+        _preload_thread.start()
+        log.info("Voice service ready; preloading Whisper in background.")
+    else:
+        log.info("Voice service ready; models will load on first request.")
     yield
     log.info("Voice service shutting down.")
 
@@ -117,10 +174,12 @@ app = FastAPI(title="Nexus AI Voice Service", version="1.0.0", lifespan=lifespan
 # ───────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
+    preload_running = bool(_preload_thread and _preload_thread.is_alive())
     return {
         "status": "ok",
         "whisper_loaded": _whisper_model is not None,
         "voxcpm_loaded": _voxcpm_model is not None,
+        "preload_in_progress": preload_running,
         "config": {
             "whisper_model": WHISPER_MODEL,
             "whisper_compute_type": WHISPER_COMPUTE,
@@ -150,15 +209,22 @@ async def transcribe(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Upload failed: {exc}") from exc
 
     try:
-        model = get_whisper()
-        # `beam_size=1` keeps CPU inference fast; bump to 5 if accuracy matters more.
-        segments, info = model.transcribe(
-            tmp_path,
-            beam_size=int(os.environ.get("WHISPER_BEAM_SIZE", "1")),
-            vad_filter=True,  # skips silent regions → faster
-        )
-        text_parts = [seg.text for seg in segments]
-        text = "".join(text_parts).strip()
+        model = await get_whisper()
+        beam_size = int(os.environ.get("WHISPER_BEAM_SIZE", "1"))
+
+        def _run_transcribe():
+            # `beam_size=1` keeps CPU inference fast; bump to 5 if accuracy matters more.
+            segs, inf = model.transcribe(
+                tmp_path,
+                beam_size=beam_size,
+                vad_filter=True,  # skips silent regions → faster
+            )
+            return list(segs), inf
+
+        # Offload to a worker thread so the event loop stays responsive and
+        # /health keeps answering during long transcriptions.
+        segments, info = await asyncio.to_thread(_run_transcribe)
+        text = "".join(seg.text for seg in segments).strip()
         return {
             "text": text,
             "language": getattr(info, "language", None),
@@ -206,7 +272,7 @@ async def generate(req: GenerateRequest):
         ) from exc
 
     try:
-        tts = get_voxcpm()
+        tts = await get_voxcpm()
     except Exception as exc:  # noqa: BLE001
         log.exception("VoxCPM failed to load")
         raise HTTPException(status_code=503, detail=f"VoxCPM unavailable: {exc}") from exc
@@ -227,7 +293,9 @@ async def generate(req: GenerateRequest):
                 )
             kwargs["prompt_wav_path"] = req.reference_wav_path
 
-        wav = tts.generate(**kwargs)
+        # Run the blocking inference off-thread so concurrent /health pings
+        # (from the Node.js manager) still get prompt replies.
+        wav = await asyncio.to_thread(lambda: tts.generate(**kwargs))
 
         # VoxCPM commonly emits at 16 kHz; fall back safely if not exposed.
         sample_rate = getattr(tts, "sample_rate", 16000)

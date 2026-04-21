@@ -9,6 +9,7 @@ import { WhatsAppAdapter } from './adapters/whatsapp.js';
 import { IMessageAdapter } from './adapters/imessage.js';
 import { VoiceAdapter } from './adapters/voice.js';
 import { CalendarAdapter } from './adapters/calendar.js';
+import { VoiceProcessManager } from './core/voice-process-manager.js';
 import { createWebServer } from './server.js';
 import { existsSync } from 'fs';
 
@@ -101,6 +102,35 @@ async function main() {
   }
 
   // ─── Initialize Voice ─────────────────────────────────
+  // Lifecycle manager owns the Python TTS/STT child: auto-starts it at boot,
+  // kills it after 2 min idle to free RAM, re-spawns on demand when a voice
+  // request arrives while asleep. Only instantiated when voice is enabled so
+  // the dependency is strictly opt-in.
+  let voiceManager = null;
+  if (process.env.VOICE_ENABLED !== 'false') {
+    voiceManager = new VoiceProcessManager({
+      port: Number(process.env.VOICE_PORT || 8808),
+      idleMs: Number(process.env.VOICE_IDLE_MS || 2 * 60 * 1000),
+    });
+    // Expose on the engine so transcribeAudio/textToSpeech can auto-wake.
+    ai.setVoiceManager(voiceManager);
+    // Expose to adapters (via globalThis) for the "Waking up voice engine…"
+    // UX notification. Adapters import this lazily — see telegram.js.
+    globalThis.__voiceManager = voiceManager;
+    console.log('  ✓ VoiceProcessManager attached (port ' + voiceManager.port +
+                ', idle ' + Math.round(voiceManager.idleMs / 1000) + 's)');
+
+    // Fire-and-forget: don't block the rest of the boot. If spawn fails,
+    // log the real reason — the manager now includes Python stderr in its
+    // error messages (missing uvicorn, port clash, etc.).
+    voiceManager.start().catch((err) => {
+      console.error(`  ✗ Voice service failed to auto-start:\n${err.message}`);
+      console.error(`    Voice features will remain unavailable until this is fixed.`);
+    });
+  } else {
+    console.log('  ○ Voice service disabled (VOICE_ENABLED=false)');
+  }
+
   const voice = new VoiceAdapter(ai);
   voice.initialize();
 
@@ -207,6 +237,15 @@ async function main() {
         global.__cipherScheduler.stop();
       } catch (e) {
         console.error('  Error stopping Cipher:', e.message);
+      }
+    }
+
+    // Tear down the Python voice service if we launched it.
+    if (voiceManager) {
+      try {
+        await voiceManager.shutdown({ reason: signal });
+      } catch (e) {
+        console.error('  Error stopping voice service:', e.message);
       }
     }
 

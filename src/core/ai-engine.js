@@ -32,6 +32,18 @@ export class AIEngine extends EventEmitter {
     this.temperature = config.temperature || 0.7;
     this.systemPrompt = config.systemPrompt || process.env.SYSTEM_PROMPT ||
       'You are Nexus, a helpful, friendly, and knowledgeable personal AI assistant. You are concise but thorough.';
+
+    // Optional lifecycle supervisor for the local Python voice service.
+    // When set, every transcribe/synthesize call will (a) wait for the
+    // service to be reachable, and (b) reset the service's idle timer.
+    // Injected via setVoiceManager() from src/index.js so the engine
+    // stays constructable without a manager for tests.
+    this.voiceManager = config.voiceManager || null;
+  }
+
+  /** Attach/replace the VoiceProcessManager after construction. */
+  setVoiceManager(manager) {
+    this.voiceManager = manager || null;
   }
 
   initialize() {
@@ -683,6 +695,10 @@ export class AIEngine extends EventEmitter {
    * @returns {Promise<string>} transcribed text.
    */
   async transcribeAudio(audioBuffer, filename = 'audio.webm') {
+    // If a lifecycle manager is attached, ensure the Python service is awake
+    // (lazy-spawn + /health ping) before we send any bytes at it.
+    const baseUrl = await this._ensureVoiceReady();
+
     // Build multipart form data compatible with UploadFile on the Python side.
     const form = new FormData();
     const mime = this._guessAudioMime(filename);
@@ -690,12 +706,12 @@ export class AIEngine extends EventEmitter {
 
     let resp;
     try {
-      resp = await fetch(`${VOICE_SERVICE_URL}/transcribe`, {
+      resp = await fetch(`${baseUrl}/transcribe`, {
         method: 'POST',
         body: form
       });
     } catch (err) {
-      throw new Error(`Voice service unreachable at ${VOICE_SERVICE_URL}. ` +
+      throw new Error(`Voice service unreachable at ${baseUrl}. ` +
         `Start it with: \`python services/tts/server.py\`. (${err.message})`);
     }
 
@@ -705,6 +721,9 @@ export class AIEngine extends EventEmitter {
     }
 
     const data = await resp.json();
+    // Reset the idle-shutdown timer ONLY after a successful round-trip — a
+    // failed request shouldn't keep a stuck service alive.
+    this.voiceManager?.markActivity?.();
     return data.text || '';
   }
 
@@ -718,9 +737,11 @@ export class AIEngine extends EventEmitter {
   async textToSpeech(text, options = {}) {
     if (!text || !text.trim()) throw new Error('textToSpeech requires non-empty text');
 
+    const baseUrl = await this._ensureVoiceReady();
+
     let resp;
     try {
-      resp = await fetch(`${VOICE_SERVICE_URL}/generate`, {
+      resp = await fetch(`${baseUrl}/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -731,7 +752,7 @@ export class AIEngine extends EventEmitter {
         })
       });
     } catch (err) {
-      throw new Error(`Voice service unreachable at ${VOICE_SERVICE_URL}. ` +
+      throw new Error(`Voice service unreachable at ${baseUrl}. ` +
         `Start it with: \`python services/tts/server.py\`. (${err.message})`);
     }
 
@@ -741,7 +762,27 @@ export class AIEngine extends EventEmitter {
     }
 
     const arrayBuf = await resp.arrayBuffer();
+    this.voiceManager?.markActivity?.();
     return Buffer.from(arrayBuf);
+  }
+
+  /**
+   * If a VoiceProcessManager is attached, block until the service is
+   * reachable and return its baseUrl. Otherwise fall back to the
+   * environment-configured VOICE_SERVICE_URL (legacy path).
+   */
+  async _ensureVoiceReady() {
+    if (this.voiceManager) {
+      try {
+        const { baseUrl } = await this.voiceManager.ensureAwake();
+        return baseUrl;
+      } catch (err) {
+        // Surface the manager's diagnostic message (stderr, hint, etc.) rather
+        // than letting the caller fall through to a generic "fetch failed".
+        throw new Error(`Voice service cold-start failed — ${err.message}`);
+      }
+    }
+    return VOICE_SERVICE_URL;
   }
 
   _guessAudioMime(filename) {
