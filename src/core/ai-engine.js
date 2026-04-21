@@ -716,8 +716,13 @@ export class AIEngine extends EventEmitter {
       // so the next call triggers a fresh cold-start instead of hitting the
       // same corpse again.
       await this._reportVoiceFetchFailure(err);
-      throw new Error(`Voice service unreachable at ${baseUrl}. ` +
-        `Start it with: \`python services/tts/server.py\`. (${err.message})`);
+      throw new Error(
+        `Voice service unreachable at ${baseUrl} (${err.message}). ` +
+        `The Python TTS/STT service is started automatically by Nexus — ` +
+        `do NOT launch it manually. Check your npm start logs for [voice-py] ` +
+        `errors. Most common cause: \`pip install fastapi uvicorn python-multipart ` +
+        `faster-whisper voxcpm soundfile numpy\` hasn't been run.`
+      );
     }
 
     if (!resp.ok) {
@@ -758,8 +763,13 @@ export class AIEngine extends EventEmitter {
       });
     } catch (err) {
       await this._reportVoiceFetchFailure(err);
-      throw new Error(`Voice service unreachable at ${baseUrl}. ` +
-        `Start it with: \`python services/tts/server.py\`. (${err.message})`);
+      throw new Error(
+        `Voice service unreachable at ${baseUrl} (${err.message}). ` +
+        `The Python TTS/STT service is started automatically by Nexus — ` +
+        `do NOT launch it manually. Check your npm start logs for [voice-py] ` +
+        `errors. Most common cause: \`pip install fastapi uvicorn python-multipart ` +
+        `faster-whisper voxcpm soundfile numpy\` hasn't been run.`
+      );
     }
 
     if (!resp.ok) {
