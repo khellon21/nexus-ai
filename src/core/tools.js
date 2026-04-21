@@ -3,8 +3,191 @@
  * Defines tool schemas and execution logic.
  */
 
+import fs from 'fs/promises';
+import path from 'path';
+import os from 'os';
+import { exec } from 'child_process';
+import util from 'util';
+import simpleGit from 'simple-git';
+import { search } from 'duck-duck-scrape';
+
+const execAsync = util.promisify(exec);
+
+// ─── Hardening constants (audit pass) ─────────────────────────
+// Subprocess deadlines — a stuck auth prompt or hanging remote must not
+// freeze the whole tool loop. 120s is generous for a typical `npm install`
+// and more than enough for `git push` on a healthy network.
+const NPM_TIMEOUT_MS = Number(process.env.NEXUS_NPM_TIMEOUT_MS || 120_000);
+const GIT_TIMEOUT_MS = Number(process.env.NEXUS_GIT_TIMEOUT_MS || 60_000);
+
+// Cap how much file content the model can pull back into its context window.
+// Models that try to read a 50MB log shouldn't blow the session.
+const READ_FILE_MAX_BYTES = Number(process.env.NEXUS_READ_MAX_BYTES || 512 * 1024);
+
+// Soft cap on search snippet length to keep tool outputs compact.
+const SEARCH_SNIPPET_MAX_CHARS = 400;
+const SEARCH_TIMEOUT_MS = 15_000;
+
+/**
+ * exec() wrapper that enforces a hard timeout via AbortController. When the
+ * timer fires, the child process receives SIGTERM and we surface a concise
+ * timeout error instead of hanging the loop. Stdout/stderr are still captured.
+ */
+async function execWithTimeout(command, { cwd = process.cwd(), timeoutMs = 60_000, env } = {}) {
+  const controller = new AbortController();
+  const killer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    // Node ≥ 15: passing `signal` into exec honours AbortController.
+    const result = await execAsync(command, {
+      cwd,
+      signal: controller.signal,
+      env: { ...process.env, ...(env || {}) },
+      // Large enough to capture reasonable output without OOM-ing.
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return { ok: true, stdout: result.stdout || '', stderr: result.stderr || '' };
+  } catch (err) {
+    const aborted = controller.signal.aborted || err.name === 'AbortError' || err.code === 'ABORT_ERR';
+    return {
+      ok: false,
+      aborted,
+      stdout: err.stdout || '',
+      stderr: err.stderr || '',
+      message: aborted
+        ? `Command exceeded ${timeoutMs}ms and was aborted`
+        : (err.message || String(err)),
+    };
+  } finally {
+    clearTimeout(killer);
+  }
+}
+
+// ─── Epic 2: Pure-JS embedding + Cosine similarity ─────────────
+// Rationale: cloud vector DBs are overkill for a personal assistant on
+// low-end hardware, and importing a neural embedding runtime (e.g. onnx)
+// adds ~200MB and cold-start latency. A character-n-gram feature-hashing
+// vectorizer gives us deterministic, dependency-free embeddings that are
+// "good enough" for short factual recall — e.g. matching "user's dog is
+// named Mochi" against a later query like "what's my dog called?".
+//
+// If you later want real semantic embeddings, replace `embed()` with a
+// fetch call to a Python service (e.g. a /embed endpoint powered by
+// sentence-transformers) — nothing else needs to change.
+
+const EMBEDDING_DIM = 384;
+
+/**
+ * Normalize text for deterministic feature extraction.
+ */
+function _normalize(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Stable 32-bit FNV-1a hash — fast, no deps, good dispersion.
+ */
+function _fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/**
+ * Generate a fixed-dimension embedding using hashed character trigrams
+ * + hashed word tokens. Vector is L2-normalized so that dot product ==
+ * cosine similarity for fast retrieval.
+ *
+ * @param {string} text
+ * @returns {number[]} length EMBEDDING_DIM
+ */
+export function embed(text) {
+  const vec = new Float32Array(EMBEDDING_DIM);
+  const norm = _normalize(text);
+  if (!norm) return Array.from(vec);
+
+  // Character trigrams (robust to typos / inflection).
+  const padded = ` ${norm} `;
+  for (let i = 0; i < padded.length - 2; i++) {
+    const gram = padded.slice(i, i + 3);
+    vec[_fnv1a(gram) % EMBEDDING_DIM] += 1;
+  }
+
+  // Word-level tokens (boosts exact semantic matches).
+  for (const word of norm.split(' ')) {
+    if (!word) continue;
+    vec[_fnv1a('w:' + word) % EMBEDDING_DIM] += 2;
+  }
+
+  // L2-normalize
+  let sumSq = 0;
+  for (let i = 0; i < vec.length; i++) sumSq += vec[i] * vec[i];
+  const mag = Math.sqrt(sumSq) || 1;
+  for (let i = 0; i < vec.length; i++) vec[i] /= mag;
+
+  return Array.from(vec);
+}
+
+/**
+ * Cosine similarity between two equal-length number arrays.
+ * Returns a value in [-1, 1]. Safe on zero-magnitude inputs (returns 0).
+ */
+export function cosineSimilarity(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return 0;
+  const n = Math.min(a.length, b.length);
+  if (n === 0) return 0;
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < n; i++) {
+    const x = a[i], y = b[i];
+    dot += x * y;
+    magA += x * x;
+    magB += y * y;
+  }
+  if (magA === 0 || magB === 0) return 0;
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
 export const getToolsSchema = (provider) => {
   const schemas = [
+    {
+      type: 'function',
+      function: {
+        name: 'manage_workspace_file',
+        description: 'Read, write, or append to files in your private user workspace. Use this to update USER.md, SOUL.md, tracking projects, or preferences. ONLY .md files are supported.',
+        parameters: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['read', 'write', 'append'], description: 'The action to perform on the file.' },
+            filename: { type: 'string', description: 'The filename, e.g. "USER.md" or "PROJECT.md".' },
+            content: { type: 'string', description: 'The text to write or append (not needed for read).' }
+          },
+          required: ['action', 'filename']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'save_core_memory',
+        // Epic 2: autonomous long-term memory. The AI decides when a fact
+        // is durable enough to be worth remembering across sessions.
+        description: "Save a durable fact about the user or their world to long-term memory. Use this whenever the user shares a stable personal preference, relationship, goal, or identifying detail (e.g. \"I'm vegetarian\", \"my dog's name is Mochi\", \"I ship to 123 Main St\"). Do NOT use for short-lived conversational context — only for facts worth recalling in future unrelated conversations.",
+        parameters: {
+          type: 'object',
+          properties: {
+            fact: { type: 'string', description: 'A single concise sentence stating the fact to remember.' },
+            category: { type: 'string', description: 'A short bucket name such as "preference", "relationship", "goal", "identity", "routine".' }
+          },
+          required: ['fact', 'category']
+        }
+      }
+    },
     {
       type: 'function',
       function: {
@@ -112,6 +295,91 @@ export const getToolsSchema = (provider) => {
         description: 'Get the calendar sync URL and setup instructions. Returns the ICS feed URL that users can subscribe to in Apple Calendar, Google Calendar, or Outlook to see all their assignment deadlines.',
         parameters: { type: 'object', properties: {} }
       }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'search_internet',
+        description: 'Search the internet for information, documentation, or tutorials if you get stuck.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'The search query to look up on DuckDuckGo.' }
+          },
+          required: ['query']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'create_directory',
+        description: 'Create a new directory (and any necessary parent directories) in the project workspace.',
+        parameters: {
+          type: 'object',
+          properties: {
+            dirPath: { type: 'string', description: 'The absolute or relative path of the directory to create.' }
+          },
+          required: ['dirPath']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read_source_file',
+        description: 'Read the contents of any file in the project workspace.',
+        parameters: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string', description: 'The absolute or relative path of the file to read.' }
+          },
+          required: ['filePath']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'edit_source_file',
+        description: 'Edit or create a file in the project workspace by providing its COMPLETE, fully updated content to replace the file.',
+        parameters: {
+          type: 'object',
+          properties: {
+            filePath: { type: 'string', description: 'The absolute or relative path of the file to overwrite or create.' },
+            content: { type: 'string', description: 'The complete new content of the file. Do NOT just pass a substring, pass the entire file content.' }
+          },
+          required: ['filePath', 'content']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'git_commit_and_push',
+        description: 'Commit and push local modifications to the GitHub remote repository.',
+        parameters: {
+          type: 'object',
+          properties: {
+            commit_message: { type: 'string', description: 'The commit message describing your changes.' }
+          },
+          required: ['commit_message']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'install_npm_package',
+        description: 'Install a required NPM package. This action requires human permission, so the loop will pause and ask the user to approve.',
+        parameters: {
+          type: 'object',
+          properties: {
+            package_name: { type: 'string', description: 'The exact name of the NPM package to install.' }
+          },
+          required: ['package_name']
+        }
+      }
     }
   ];
 
@@ -136,7 +404,7 @@ export class ToolExecutor {
     this.tabId = null;
   }
 
-  async execute(call) {
+  async execute(call, context = {}) {
     const { name, arguments: args } = call;
     let params = {};
     try {
@@ -151,6 +419,10 @@ export class ToolExecutor {
 
     try {
       switch (name) {
+        case 'manage_workspace_file':
+          return await this.manageWorkspaceFile(params.action, params.filename, params.content, context);
+        case 'save_core_memory':
+          return await this.saveCoreMemory(params.fact, params.category, context);
         case 'get_current_time_and_date':
           return await this.getTime();
         case 'send_urgent_notification':
@@ -171,6 +443,18 @@ export class ToolExecutor {
           return await this.cipherScheduleSubmission(params.assignmentId, params.filePath, params.scheduledAt);
         case 'cipher_calendar_info':
           return await this.cipherCalendarInfo();
+        case 'search_internet':
+          return await this.searchInternet(params.query);
+        case 'create_directory':
+          return await this.createDirectory(params.dirPath);
+        case 'read_source_file':
+          return await this.readSourceFile(params.filePath);
+        case 'edit_source_file':
+          return await this.editSourceFile(params.filePath, params.content);
+        case 'git_commit_and_push':
+          return await this.gitCommitAndPush(params.commit_message);
+        case 'install_npm_package':
+          return await this.installNpmPackage(params.package_name);
         default:
           return JSON.stringify({ error: `Unknown tool: ${name}` });
       }
@@ -181,6 +465,51 @@ export class ToolExecutor {
 
   // ─── Tool Implementations ─────────────────────────────
 
+  async manageWorkspaceFile(action, filename, content, context) {
+    if (!context.platform || !context.platformUserId) {
+      return JSON.stringify({ error: 'Missing user context. Cannot determine workspace.' });
+    }
+    
+    // Sanitize parameters
+    const safePlatform = path.basename(String(context.platform));
+    const safeUserId = path.basename(String(context.platformUserId));
+    const safeFilename = path.basename(String(filename));
+    
+    if (!safeFilename.endsWith('.md')) {
+      return JSON.stringify({ error: 'Can only manage .md files in the workspace.' });
+    }
+
+    const workspaceDir = path.join(process.cwd(), 'data', 'workspaces', `${safePlatform}_${safeUserId}`);
+    const filePath = path.join(workspaceDir, safeFilename);
+
+    try {
+      // Ensure the directory exists before modifying anything
+      await fs.mkdir(workspaceDir, { recursive: true });
+
+      switch (action) {
+        case 'read':
+          try {
+            const data = await fs.readFile(filePath, 'utf-8');
+            return JSON.stringify({ status: 'success', content: data });
+          } catch (e) {
+            return JSON.stringify({ error: `File not found or unreadable: ${safeFilename}` });
+          }
+        case 'write':
+          if (content === undefined) return JSON.stringify({ error: 'Missing content to write.' });
+          await fs.writeFile(filePath, content, 'utf-8');
+          return JSON.stringify({ status: 'success', message: `Wrote to ${safeFilename}` });
+        case 'append':
+          if (content === undefined) return JSON.stringify({ error: 'Missing content to append.' });
+          await fs.appendFile(filePath, `\n${content}`, 'utf-8');
+          return JSON.stringify({ status: 'success', message: `Appended to ${safeFilename}` });
+        default:
+          return JSON.stringify({ error: `Invalid action: ${action}` });
+      }
+    } catch (e) {
+      return JSON.stringify({ error: `Filesystem error: ${e.message}` });
+    }
+  }
+
   async getTime() {
     const now = new Date();
     return JSON.stringify({
@@ -188,6 +517,37 @@ export class ToolExecutor {
       currentDate: now.toDateString(),
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
     });
+  }
+
+  /**
+   * Epic 2: Persist a fact into the long-term semantic memory store.
+   * The vector is computed here from the fact content and saved alongside it;
+   * cosine search happens later inside ConversationManager._injectMemories().
+   */
+  async saveCoreMemory(fact, category, context = {}) {
+    if (!fact || !String(fact).trim()) {
+      return JSON.stringify({ error: 'fact is required and must be non-empty' });
+    }
+    const db = this.conversationManager?.db;
+    if (!db) {
+      return JSON.stringify({ error: 'Database not available in ToolExecutor context.' });
+    }
+
+    try {
+      const vector = embed(fact);
+      const id = db.addMemory({
+        content: String(fact).trim(),
+        category: category || 'general',
+        vector,
+        platform: context.platform || null,
+        platformUserId: context.platformUserId || null
+      });
+
+      console.log(`\x1b[34m  [Memory] Saved (${category || 'general'}): ${fact.slice(0, 80)}\x1b[0m`);
+      return JSON.stringify({ status: 'success', id, message: 'Remembered.' });
+    } catch (e) {
+      return JSON.stringify({ error: `Failed to save memory: ${e.message}` });
+    }
   }
 
   async browserNavigate(url) {
@@ -334,6 +694,235 @@ export class ToolExecutor {
         outlook: `Open Outlook → Add calendar → Subscribe from web → Paste: ${icsUrl}`
       },
       note: 'The ICS feed auto-updates with your latest assignments. Subscribe once and it stays synced.'
+    });
+  }
+
+  // ─── Agent Autonomy Tools ──────────────────────────────
+
+  // ─── Agent Autonomy Tools (audit-hardened) ────────────────────
+  // Shared helper: write an audit-log entry when the DB is reachable. Never
+  // throws — audit failures should not surface to the model as tool errors.
+  _audit(eventType, details) {
+    try {
+      this.conversationManager?.db?.logAuditEvent?.(eventType, JSON.stringify(details));
+    } catch { /* swallow — audit is best-effort */ }
+  }
+
+  async searchInternet(query) {
+    if (!query || !String(query).trim()) {
+      return JSON.stringify({ error: 'Empty search query' });
+    }
+    console.log(`\x1b[36m  [Tool] Searching internet: ${query}\x1b[0m`);
+
+    // Bound the search call itself — duck-duck-scrape occasionally hangs.
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Search timed out')), SEARCH_TIMEOUT_MS));
+
+    try {
+      const results = await Promise.race([
+        search(query, { safeSearch: 'off' }),
+        timeout,
+      ]);
+      const topResults = (results.noResults ? [] : results.results.slice(0, 5)).map(r => ({
+        title: r.title,
+        url: r.url,
+        description: (r.description || '').slice(0, SEARCH_SNIPPET_MAX_CHARS),
+      }));
+      return JSON.stringify({
+        results: topResults,
+        message: topResults.length ? 'Success' : 'No results found',
+      });
+    } catch (e) {
+      return JSON.stringify({ error: `Search failed: ${e.message}` });
+    }
+  }
+
+  async createDirectory(dirPath) {
+    if (!dirPath || typeof dirPath !== 'string') {
+      return JSON.stringify({ error: 'dirPath is required', cwd: process.cwd() });
+    }
+    try {
+      await fs.mkdir(dirPath, { recursive: true });
+      this._audit('create_directory', { dirPath, cwd: process.cwd() });
+      return JSON.stringify({
+        status: 'success',
+        cwd: process.cwd(),
+        message: `Created directory: ${dirPath}`,
+      });
+    } catch (e) {
+      return JSON.stringify({ error: `Failed to create directory: ${e.message}`, cwd: process.cwd() });
+    }
+  }
+
+  async readSourceFile(filePath) {
+    if (!filePath || typeof filePath !== 'string') {
+      return JSON.stringify({ error: 'filePath is required', cwd: process.cwd() });
+    }
+    try {
+      // Stat first so we can reject oversized reads before loading them.
+      const stat = await fs.stat(filePath);
+      if (!stat.isFile()) {
+        return JSON.stringify({ error: `Not a regular file: ${filePath}`, cwd: process.cwd() });
+      }
+
+      let truncated = false;
+      let data;
+      if (stat.size > READ_FILE_MAX_BYTES) {
+        // Stream-read only the first READ_FILE_MAX_BYTES to keep the context
+        // window sane. The model is told the file was truncated.
+        const fh = await fs.open(filePath, 'r');
+        try {
+          const buf = Buffer.alloc(READ_FILE_MAX_BYTES);
+          await fh.read(buf, 0, READ_FILE_MAX_BYTES, 0);
+          data = buf.toString('utf-8');
+        } finally {
+          await fh.close();
+        }
+        truncated = true;
+      } else {
+        data = await fs.readFile(filePath, 'utf-8');
+      }
+
+      return JSON.stringify({
+        status: 'success',
+        cwd: process.cwd(),
+        content: data,
+        truncated,
+        originalSize: stat.size,
+        note: truncated
+          ? `File was truncated to first ${READ_FILE_MAX_BYTES} bytes of ${stat.size}.`
+          : undefined,
+      });
+    } catch (e) {
+      return JSON.stringify({ error: `Failed to read file: ${e.message}`, cwd: process.cwd() });
+    }
+  }
+
+  /**
+   * Atomic full-file replacement. Writes to a tempfile in the same directory
+   * as the target (so rename stays atomic on POSIX) and then renames over
+   * the target. If anything fails mid-write, the original file is untouched.
+   */
+  async editSourceFile(filePath, content) {
+    if (!filePath || typeof filePath !== 'string') {
+      return JSON.stringify({ error: 'filePath is required', cwd: process.cwd() });
+    }
+    if (content === undefined || content === null) {
+      return JSON.stringify({ error: 'content is required', cwd: process.cwd() });
+    }
+
+    const absPath = path.resolve(filePath);
+    const dir = path.dirname(absPath);
+    // Random suffix keeps concurrent edits from colliding.
+    const tmpPath = path.join(dir, `.${path.basename(absPath)}.${process.pid}.${Date.now()}.tmp`);
+
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(tmpPath, content, 'utf-8');
+      await fs.rename(tmpPath, absPath);
+
+      this._audit('edit_source_file', {
+        filePath,
+        cwd: process.cwd(),
+        bytes: Buffer.byteLength(content, 'utf-8'),
+      });
+
+      return JSON.stringify({
+        status: 'success',
+        cwd: process.cwd(),
+        message: `File updated completely: ${filePath}`,
+      });
+    } catch (e) {
+      // Clean up dangling tempfile so the directory doesn't accumulate cruft.
+      try { await fs.unlink(tmpPath); } catch { /* tempfile may not exist */ }
+      return JSON.stringify({ error: `Failed to write file: ${e.message}`, cwd: process.cwd() });
+    }
+  }
+
+  async gitCommitAndPush(commitMessage) {
+    const cwd = process.cwd();
+    try {
+      const git = simpleGit(cwd);
+      const status = await git.status();
+      if (status.isClean()) {
+        return JSON.stringify({ status: 'success', message: 'No changes detected to commit.' });
+      }
+      await git.add('.');
+      await git.commit(commitMessage || 'Automated commit by Nexus AI');
+
+      // simple-git doesn't expose a per-call timeout, so we shell out to
+      // `git push` via our bounded exec wrapper. This prevents a stuck
+      // credential prompt from hanging the whole tool loop indefinitely.
+      const push = await execWithTimeout('git push', {
+        cwd,
+        timeoutMs: GIT_TIMEOUT_MS,
+        // Ensure pushes never block on interactive auth prompts.
+        env: { GIT_TERMINAL_PROMPT: '0' },
+      });
+
+      if (!push.ok) {
+        this._audit('git_commit_and_push', { ok: false, error: push.message, commitMessage });
+        return JSON.stringify({
+          error: `Git push failed: ${push.message}`,
+          stdout: push.stdout.slice(0, 1000),
+          stderr: push.stderr.slice(0, 1000),
+          aborted: push.aborted || false,
+        });
+      }
+
+      this._audit('git_commit_and_push', { ok: true, commitMessage });
+      return JSON.stringify({
+        status: 'success',
+        message: `Committed and pushed: "${commitMessage}"`,
+        stdout: push.stdout.slice(0, 1000),
+        stderr: push.stderr.slice(0, 1000),
+      });
+    } catch (e) {
+      this._audit('git_commit_and_push', { ok: false, error: e.message });
+      return JSON.stringify({ error: `Git operation failed: ${e.message}` });
+    }
+  }
+
+  async installNpmPackage(packageName) {
+    if (!packageName) return JSON.stringify({ error: 'Empty package name' });
+
+    // Allow scoped packages (@scope/pkg), version pins (pkg@1.2.3), but
+    // strip any shell metachars. If stripping changes the input we refuse
+    // so the model doesn't think it installed a silently-rewritten package.
+    const safePackageName = String(packageName).replace(/[^a-zA-Z0-9_\-\.\@\/]/g, '');
+    if (safePackageName !== packageName) {
+      return JSON.stringify({
+        error: `Unsafe package name provided. Attempted: ${packageName}. Sanitized: ${safePackageName}`,
+      });
+    }
+
+    console.log(`\x1b[36m  [Tool] Installing NPM package: ${safePackageName}\x1b[0m`);
+
+    const result = await execWithTimeout(
+      `npm install --no-fund --no-audit ${safePackageName}`,
+      {
+        cwd: process.cwd(),
+        timeoutMs: NPM_TIMEOUT_MS,
+        // Disable colorized output and interactive prompts for cleaner logs.
+        env: { CI: '1', npm_config_progress: 'false', npm_config_color: 'false' },
+      }
+    );
+
+    if (!result.ok) {
+      this._audit('install_npm_package', { ok: false, pkg: safePackageName, error: result.message });
+      return JSON.stringify({
+        error: `NPM install failed: ${result.message}`,
+        stdout: result.stdout.slice(0, 1000),
+        stderr: result.stderr.slice(0, 1000),
+        aborted: result.aborted || false,
+      });
+    }
+
+    this._audit('install_npm_package', { ok: true, pkg: safePackageName });
+    return JSON.stringify({
+      status: 'success',
+      stdout: result.stdout.slice(0, 1000),
+      stderr: result.stderr.slice(0, 1000),
     });
   }
 }

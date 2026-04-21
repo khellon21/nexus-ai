@@ -1,14 +1,22 @@
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import Anthropic from '@anthropic-ai/sdk';
 import { EventEmitter } from 'events';
 import { getToolsSchema } from './tools.js';
 
 // ─── Provider Detection ─────────────────────────────────
 function detectProvider(model) {
+  if (!model) return 'openai';
+  // Epic 1: Any `claude-*` model is routed to Anthropic.
+  if (model.startsWith('claude')) return 'anthropic';
   if (model.startsWith('gemini')) return 'gemini';
   if (model.includes('/')) return 'nvidia';
   return 'openai';
 }
+
+// Voice microservice base URL (Epics 3 & 4).
+const VOICE_SERVICE_URL =
+  process.env.VOICE_SERVICE_URL || 'http://localhost:8808';
 
 export class AIEngine extends EventEmitter {
   constructor(config = {}) {
@@ -16,17 +24,18 @@ export class AIEngine extends EventEmitter {
     this.openaiClient = null;
     this.geminiClient = null;
     this.nvidiaClient = null;
+    this.anthropicClient = null; // Epic 1
     this.geminiModel = null;
     this.model = config.model || process.env.AI_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
     this.provider = config.provider || process.env.AI_PROVIDER || detectProvider(this.model);
     this.maxTokens = config.maxTokens || 4096;
     this.temperature = config.temperature || 0.7;
-    this.systemPrompt = config.systemPrompt || process.env.SYSTEM_PROMPT || 
+    this.systemPrompt = config.systemPrompt || process.env.SYSTEM_PROMPT ||
       'You are Nexus, a helpful, friendly, and knowledgeable personal AI assistant. You are concise but thorough.';
   }
 
   initialize() {
-    // Initialize OpenAI if we have a key (needed for voice even when using Gemini)
+    // Initialize OpenAI if we have a key (kept as a fallback even when another provider is primary).
     const openaiKey = process.env.OPENAI_API_KEY;
     if (openaiKey && openaiKey !== 'sk-your-key-here') {
       this.openaiClient = new OpenAI({ apiKey: openaiKey });
@@ -36,7 +45,7 @@ export class AIEngine extends EventEmitter {
     const geminiKey = process.env.GEMINI_API_KEY;
     if (geminiKey) {
       this.geminiClient = new GoogleGenerativeAI(geminiKey);
-      this.geminiModel = this.geminiClient.getGenerativeModel({ 
+      this.geminiModel = this.geminiClient.getGenerativeModel({
         model: this.provider === 'gemini' ? this.model : 'gemini-2.0-flash'
       });
     }
@@ -44,10 +53,16 @@ export class AIEngine extends EventEmitter {
     // Initialize NVIDIA if configured
     const nvidiaKey = process.env.NVIDIA_API_KEY;
     if (nvidiaKey) {
-      this.nvidiaClient = new OpenAI({ 
-        apiKey: nvidiaKey, 
-        baseURL: 'https://integrate.api.nvidia.com/v1' 
+      this.nvidiaClient = new OpenAI({
+        apiKey: nvidiaKey,
+        baseURL: 'https://integrate.api.nvidia.com/v1'
       });
+    }
+
+    // Epic 1: Initialize Anthropic (Claude) if configured.
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (anthropicKey && anthropicKey !== 'sk-ant-your-key-here') {
+      this.anthropicClient = new Anthropic({ apiKey: anthropicKey });
     }
 
     // Validate that the chosen provider has credentials
@@ -60,8 +75,15 @@ export class AIEngine extends EventEmitter {
     if (this.provider === 'nvidia' && !this.nvidiaClient) {
       throw new Error('NVIDIA provider selected but NVIDIA_API_KEY is not set. Run `npm run setup`.');
     }
+    if (this.provider === 'anthropic' && !this.anthropicClient) {
+      throw new Error('Anthropic provider selected but ANTHROPIC_API_KEY is not set. Run `npm run setup`.');
+    }
 
-    const providerLabel = this.provider === 'gemini' ? 'Google Gemini' : (this.provider === 'nvidia' ? 'NVIDIA NIM' : 'OpenAI');
+    const providerLabel =
+      this.provider === 'gemini' ? 'Google Gemini'
+        : this.provider === 'nvidia' ? 'NVIDIA NIM'
+          : this.provider === 'anthropic' ? 'Anthropic Claude'
+            : 'OpenAI';
     console.log(`  ✓ AI Engine initialized (${providerLabel}: ${this.model})`);
   }
 
@@ -71,9 +93,8 @@ export class AIEngine extends EventEmitter {
     const model = options.model || this.model;
     const provider = detectProvider(model);
 
-    if (provider === 'gemini') {
-      return this._geminiChat(messages, { ...options, model });
-    }
+    if (provider === 'gemini') return this._geminiChat(messages, { ...options, model });
+    if (provider === 'anthropic') return this._claudeChat(messages, { ...options, model }); // Epic 1
     return this._openaiChat(messages, provider, { ...options, model });
   }
 
@@ -81,14 +102,19 @@ export class AIEngine extends EventEmitter {
     const client = provider === 'nvidia' ? this.nvidiaClient : this.openaiClient;
     if (!client) throw new Error(`${provider} client not initialized`);
 
-    const systemMessage = { role: 'system', content: this.systemPrompt };
-    const formattedMessages = [systemMessage, ...messages.map(m => {
-      const msg = { role: m.role, content: m.content };
-      if (m.tool_calls) msg.tool_calls = m.tool_calls;
-      if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
-      if (m.name) msg.name = m.name;
-      return msg;
-    })];
+    // If caller already injected a `system` role message (e.g., from the
+    // ConversationManager with dynamic memory), use it. Otherwise fall back
+    // to the engine's default system prompt.
+    const hasSystem = messages.some(m => m.role === 'system');
+    const formattedMessages = hasSystem
+      ? messages.map(m => ({ ...m }))
+      : [{ role: 'system', content: this.systemPrompt }, ...messages.map(m => {
+        const msg = { role: m.role, content: m.content };
+        if (m.tool_calls) msg.tool_calls = m.tool_calls;
+        if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+        if (m.name) msg.name = m.name;
+        return msg;
+      })];
 
     const tools = getToolsSchema('openai');
 
@@ -99,7 +125,7 @@ export class AIEngine extends EventEmitter {
         max_tokens: options.maxTokens || this.maxTokens,
         temperature: options.temperature || this.temperature,
         tools: tools,
-        tool_choice: "auto"
+        tool_choice: 'auto'
       });
 
       const messageObj = response.choices[0]?.message;
@@ -131,7 +157,11 @@ export class AIEngine extends EventEmitter {
     const modelName = options.model || this.model;
     const genModel = this.geminiClient.getGenerativeModel({ model: modelName });
 
-    // Build Gemini conversation history
+    // Extract system content — prefer a caller-injected system message, otherwise use default.
+    const systemMessages = messages.filter(m => m.role === 'system').map(m => m.content).join('\n\n');
+    const systemInstruction = systemMessages || this.systemPrompt;
+
+    // Build Gemini conversation history (system is passed separately)
     const history = [];
     const geminiMessages = messages.filter(m => m.role !== 'system');
 
@@ -159,7 +189,6 @@ export class AIEngine extends EventEmitter {
       }
     }
 
-    // Pop the last message to use as the prompt (can be user text or function response)
     const lastMsg = history.length > 0 && (history[history.length - 1].role === 'user' || history[history.length - 1].role === 'function')
       ? history.pop() : null;
 
@@ -170,7 +199,7 @@ export class AIEngine extends EventEmitter {
     try {
       const chat = genModel.startChat({
         history,
-        systemInstruction: { parts: [{ text: this.systemPrompt }] },
+        systemInstruction: { parts: [{ text: systemInstruction }] },
         tools: [{ functionDeclarations: tools }],
         generationConfig: {
           maxOutputTokens: options.maxTokens || this.maxTokens,
@@ -185,14 +214,14 @@ export class AIEngine extends EventEmitter {
 
       let formattedToolCalls = null;
       if (functionCalls && functionCalls.length > 0) {
-          formattedToolCalls = functionCalls.map(fc => ({
-              id: Math.random().toString(36).substring(7),
-              type: 'function',
-              function: {
-                 name: fc.name,
-                 arguments: JSON.stringify(fc.args)
-              }
-          }));
+        formattedToolCalls = functionCalls.map(fc => ({
+          id: Math.random().toString(36).substring(7),
+          type: 'function',
+          function: {
+            name: fc.name,
+            arguments: JSON.stringify(fc.args)
+          }
+        }));
       }
 
       return {
@@ -220,15 +249,166 @@ export class AIEngine extends EventEmitter {
     }
   }
 
+  // ─── Epic 1: Anthropic (Claude) Chat ─────────────────────────────
+  /**
+   * Claude chat completion. This handles the full round-trip between
+   * Nexus's internal OpenAI-style message format and Anthropic's
+   * tool_use / tool_result content-block format.
+   *
+   * Incoming messages we may see:
+   *   { role: 'system', content: '...' }                        ← extracted into `system`
+   *   { role: 'user', content: '...' }
+   *   { role: 'assistant', content: '...', tool_calls: [...] }  ← translated to `tool_use` blocks
+   *   { role: 'tool', tool_call_id, name, content }             ← translated to `tool_result`
+   *   { role: 'user', content: [{type:'tool_result', ...}] }    ← ConversationManager pre-formatted (Epic 1)
+   */
+  async _claudeChat(messages, options = {}) {
+    if (!this.anthropicClient) throw new Error('Anthropic client not initialized');
+
+    // 1) Extract system prompt(s) — Anthropic takes `system` as a top-level param.
+    const systemParts = messages.filter(m => m.role === 'system').map(m => m.content).filter(Boolean);
+    const systemPrompt = systemParts.length ? systemParts.join('\n\n') : this.systemPrompt;
+
+    // 2) Translate the remaining messages into Anthropic's shape.
+    const anthropicMessages = [];
+    for (const msg of messages) {
+      if (msg.role === 'system') continue;
+
+      // Tool result emitted in OpenAI-style by legacy code paths.
+      if (msg.role === 'tool') {
+        anthropicMessages.push({
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: msg.tool_call_id,
+            content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+          }]
+        });
+        continue;
+      }
+
+      // Assistant turn: may include text + tool_use blocks.
+      if (msg.role === 'assistant') {
+        const blocks = [];
+        if (msg.content && typeof msg.content === 'string' && msg.content.trim()) {
+          blocks.push({ type: 'text', text: msg.content });
+        } else if (Array.isArray(msg.content)) {
+          // Already in Anthropic block format — trust it.
+          blocks.push(...msg.content);
+        }
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          for (const call of msg.tool_calls) {
+            let input = {};
+            try { input = JSON.parse(call.function.arguments || '{}'); } catch (e) {}
+            blocks.push({
+              type: 'tool_use',
+              id: call.id,
+              name: call.function.name,
+              input
+            });
+          }
+        }
+        if (blocks.length === 0) blocks.push({ type: 'text', text: '' });
+        anthropicMessages.push({ role: 'assistant', content: blocks });
+        continue;
+      }
+
+      // User turn. Content may already be a tool_result block array (from
+      // ConversationManager's Claude-aware tool loop, per Epic 1 spec).
+      if (msg.role === 'user') {
+        anthropicMessages.push({
+          role: 'user',
+          content: Array.isArray(msg.content)
+            ? msg.content
+            : (msg.content ?? '')
+        });
+      }
+    }
+
+    // 3) Translate Nexus's standard tool schemas into Anthropic's `input_schema` shape.
+    const tools = this._mapToolsForClaude(getToolsSchema('openai'));
+
+    try {
+      const response = await this.anthropicClient.messages.create({
+        model: options.model || this.model,
+        max_tokens: options.maxTokens || this.maxTokens,
+        temperature: options.temperature ?? this.temperature,
+        system: systemPrompt,
+        messages: anthropicMessages,
+        tools
+      });
+
+      // 4) Unwrap Claude's response → Nexus's {content, tool_calls} shape.
+      let text = '';
+      let toolCalls = null;
+      if (Array.isArray(response.content)) {
+        for (const block of response.content) {
+          if (block.type === 'text') text += block.text;
+          if (block.type === 'tool_use') {
+            toolCalls = toolCalls || [];
+            toolCalls.push({
+              id: block.id,
+              type: 'function',
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.input ?? {})
+              }
+            });
+          }
+        }
+      }
+
+      // Claude signals "I want to call tools" with stop_reason === 'tool_use'.
+      // If that's the case but we somehow parsed no tool blocks, that's a bug upstream.
+      if (response.stop_reason === 'tool_use' && !toolCalls) {
+        console.warn('  ⚠ Claude returned stop_reason=tool_use but no tool_use blocks were parsed.');
+      }
+
+      const usage = response.usage || {};
+      return {
+        content: text,
+        tool_calls: toolCalls,
+        model: response.model,
+        provider: 'anthropic',
+        stop_reason: response.stop_reason,
+        usage: {
+          promptTokens: usage.input_tokens || 0,
+          completionTokens: usage.output_tokens || 0,
+          totalTokens: (usage.input_tokens || 0) + (usage.output_tokens || 0)
+        }
+      };
+    } catch (error) {
+      if (error.status === 401) throw new Error('Invalid Anthropic API key. Run `npm run setup`.');
+      if (error.status === 429) throw new Error('Anthropic rate limit reached. Please wait.');
+      if (error.status === 400) throw new Error(`Anthropic request rejected: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Map Nexus's OpenAI-style tool schemas to Anthropic's `input_schema` format.
+   * OpenAI: { type:'function', function:{ name, description, parameters } }
+   * Claude: { name, description, input_schema }
+   */
+  _mapToolsForClaude(openaiTools) {
+    return openaiTools.map(t => ({
+      name: t.function.name,
+      description: t.function.description,
+      // Anthropic expects a JSON Schema under `input_schema`.
+      input_schema: t.function.parameters && Object.keys(t.function.parameters).length
+        ? t.function.parameters
+        : { type: 'object', properties: {} }
+    }));
+  }
+
   // ─── Chat Stream ──────────────────────────────────────
 
   async chatStream(messages, onChunk, options = {}) {
     const model = options.model || this.model;
     const provider = detectProvider(model);
 
-    if (provider === 'gemini') {
-      return this._geminiChatStream(messages, onChunk, { ...options, model });
-    }
+    if (provider === 'gemini') return this._geminiChatStream(messages, onChunk, { ...options, model });
+    if (provider === 'anthropic') return this._claudeChatStream(messages, onChunk, { ...options, model });
     return this._openaiChatStream(messages, provider, onChunk, { ...options, model });
   }
 
@@ -236,14 +416,16 @@ export class AIEngine extends EventEmitter {
     const client = provider === 'nvidia' ? this.nvidiaClient : this.openaiClient;
     if (!client) throw new Error(`${provider} client not initialized`);
 
-    const systemMessage = { role: 'system', content: this.systemPrompt };
-    const formattedMessages = [systemMessage, ...messages.map(m => {
-      const msg = { role: m.role, content: m.content };
-      if (m.tool_calls) msg.tool_calls = m.tool_calls;
-      if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
-      if (m.name) msg.name = m.name;
-      return msg;
-    })];
+    const hasSystem = messages.some(m => m.role === 'system');
+    const formattedMessages = hasSystem
+      ? messages.map(m => ({ ...m }))
+      : [{ role: 'system', content: this.systemPrompt }, ...messages.map(m => {
+        const msg = { role: m.role, content: m.content };
+        if (m.tool_calls) msg.tool_calls = m.tool_calls;
+        if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+        if (m.name) msg.name = m.name;
+        return msg;
+      })];
 
     try {
       const stream = await client.chat.completions.create({
@@ -252,13 +434,13 @@ export class AIEngine extends EventEmitter {
         max_tokens: options.maxTokens || this.maxTokens,
         temperature: options.temperature || this.temperature,
         tools: getToolsSchema('openai'),
-        tool_choice: "auto",
+        tool_choice: 'auto',
         stream: true
       });
 
       let fullContent = '';
       let toolCallsList = [];
-      
+
       for await (const chunk of stream) {
         const delta = chunk.choices[0]?.delta;
         if (!delta) continue;
@@ -269,14 +451,14 @@ export class AIEngine extends EventEmitter {
         }
 
         if (delta.tool_calls) {
-           for (const tc of delta.tool_calls) {
-             const idx = tc.index;
-             if (!toolCallsList[idx]) {
-               toolCallsList[idx] = { id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments || '' } };
-             } else {
-               toolCallsList[idx].function.arguments += (tc.function.arguments || '');
-             }
-           }
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index;
+            if (!toolCallsList[idx]) {
+              toolCallsList[idx] = { id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments || '' } };
+            } else {
+              toolCallsList[idx].function.arguments += (tc.function.arguments || '');
+            }
+          }
         }
       }
 
@@ -293,6 +475,9 @@ export class AIEngine extends EventEmitter {
 
     const modelName = options.model || this.model;
     const genModel = this.geminiClient.getGenerativeModel({ model: modelName });
+
+    const systemMessages = messages.filter(m => m.role === 'system').map(m => m.content).join('\n\n');
+    const systemInstruction = systemMessages || this.systemPrompt;
 
     const history = [];
     const geminiMessages = messages.filter(m => m.role !== 'system');
@@ -331,7 +516,7 @@ export class AIEngine extends EventEmitter {
     try {
       const chat = genModel.startChat({
         history,
-        systemInstruction: { parts: [{ text: this.systemPrompt }] },
+        systemInstruction: { parts: [{ text: systemInstruction }] },
         tools: [{ functionDeclarations: tools }],
         generationConfig: {
           maxOutputTokens: options.maxTokens || this.maxTokens,
@@ -346,25 +531,23 @@ export class AIEngine extends EventEmitter {
 
       for await (const chunk of result.stream) {
         const fCalls = chunk.functionCalls();
-        if (fCalls && fCalls.length > 0) {
-           functionCalls.push(...fCalls);
-        }
+        if (fCalls && fCalls.length > 0) functionCalls.push(...fCalls);
         try {
-           const text = chunk.text();
-           if (text) {
-             fullContent += text;
-             if (onChunk) onChunk(text, fullContent);
-           }
+          const text = chunk.text();
+          if (text) {
+            fullContent += text;
+            if (onChunk) onChunk(text, fullContent);
+          }
         } catch (e) {} // chunk.text() throws if it's only a function call
       }
 
       let formattedToolCalls = null;
       if (functionCalls.length > 0) {
-          formattedToolCalls = functionCalls.map(fc => ({
-              id: Math.random().toString(36).substring(7),
-              type: 'function',
-              function: { name: fc.name, arguments: JSON.stringify(fc.args) }
-          }));
+        formattedToolCalls = functionCalls.map(fc => ({
+          id: Math.random().toString(36).substring(7),
+          type: 'function',
+          function: { name: fc.name, arguments: JSON.stringify(fc.args) }
+        }));
       }
 
       return { content: fullContent, tool_calls: formattedToolCalls, provider: 'gemini' };
@@ -379,39 +562,199 @@ export class AIEngine extends EventEmitter {
     }
   }
 
-  // ─── Voice (always uses OpenAI — Whisper + TTS) ────────
+  /**
+   * Epic 1: Claude streaming. We use the SDK's `.stream()` helper so we can
+   * incrementally forward text deltas to `onChunk`, then assemble the
+   * final response in the same standard {content, tool_calls} shape.
+   */
+  async _claudeChatStream(messages, onChunk, options = {}) {
+    if (!this.anthropicClient) throw new Error('Anthropic client not initialized');
 
-  async transcribeAudio(audioBuffer, filename = 'audio.webm') {
-    if (!this.openaiClient) {
-      throw new Error('Voice requires an OpenAI API key (for Whisper). Add OPENAI_API_KEY in .env.');
+    // Reuse the same translation logic as non-streaming by calling into it
+    // with a controlled options object, and piping deltas out. Simpler:
+    // just call the SDK directly here.
+    const systemParts = messages.filter(m => m.role === 'system').map(m => m.content).filter(Boolean);
+    const systemPrompt = systemParts.length ? systemParts.join('\n\n') : this.systemPrompt;
+
+    const anthropicMessages = [];
+    for (const msg of messages) {
+      if (msg.role === 'system') continue;
+      if (msg.role === 'tool') {
+        anthropicMessages.push({
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: msg.tool_call_id,
+            content: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
+          }]
+        });
+        continue;
+      }
+      if (msg.role === 'assistant') {
+        const blocks = [];
+        if (msg.content && typeof msg.content === 'string' && msg.content.trim()) {
+          blocks.push({ type: 'text', text: msg.content });
+        } else if (Array.isArray(msg.content)) {
+          blocks.push(...msg.content);
+        }
+        if (msg.tool_calls && msg.tool_calls.length > 0) {
+          for (const call of msg.tool_calls) {
+            let input = {};
+            try { input = JSON.parse(call.function.arguments || '{}'); } catch (e) {}
+            blocks.push({ type: 'tool_use', id: call.id, name: call.function.name, input });
+          }
+        }
+        if (blocks.length === 0) blocks.push({ type: 'text', text: '' });
+        anthropicMessages.push({ role: 'assistant', content: blocks });
+        continue;
+      }
+      if (msg.role === 'user') {
+        anthropicMessages.push({
+          role: 'user',
+          content: Array.isArray(msg.content) ? msg.content : (msg.content ?? '')
+        });
+      }
     }
 
-    const file = new File([audioBuffer], filename, { type: 'audio/webm' });
-    
-    const transcription = await this.openaiClient.audio.transcriptions.create({
-      model: 'whisper-1',
-      file: file,
-    });
+    const tools = this._mapToolsForClaude(getToolsSchema('openai'));
 
-    return transcription.text;
+    try {
+      const stream = this.anthropicClient.messages.stream({
+        model: options.model || this.model,
+        max_tokens: options.maxTokens || this.maxTokens,
+        temperature: options.temperature ?? this.temperature,
+        system: systemPrompt,
+        messages: anthropicMessages,
+        tools
+      });
+
+      let fullContent = '';
+      stream.on('text', (chunkText) => {
+        fullContent += chunkText;
+        if (onChunk) onChunk(chunkText, fullContent);
+      });
+
+      const final = await stream.finalMessage();
+
+      let toolCalls = null;
+      if (Array.isArray(final.content)) {
+        for (const block of final.content) {
+          if (block.type === 'tool_use') {
+            toolCalls = toolCalls || [];
+            toolCalls.push({
+              id: block.id,
+              type: 'function',
+              function: {
+                name: block.name,
+                arguments: JSON.stringify(block.input ?? {})
+              }
+            });
+          }
+        }
+      }
+
+      const usage = final.usage || {};
+      return {
+        content: fullContent,
+        tool_calls: toolCalls,
+        provider: 'anthropic',
+        stop_reason: final.stop_reason,
+        usage: {
+          promptTokens: usage.input_tokens || 0,
+          completionTokens: usage.output_tokens || 0,
+          totalTokens: (usage.input_tokens || 0) + (usage.output_tokens || 0)
+        }
+      };
+    } catch (error) {
+      if (error.status === 401) throw new Error('Invalid Anthropic API key. Run `npm run setup`.');
+      if (error.status === 429) throw new Error('Anthropic rate limit reached. Please wait.');
+      throw error;
+    }
   }
 
-  async textToSpeech(text, options = {}) {
-    if (!this.openaiClient) {
-      throw new Error('Voice requires an OpenAI API key (for TTS). Add OPENAI_API_KEY in .env.');
+  // ─── Voice ─────────────────────────────────────────────
+  // Epics 3 & 4: STT and TTS are now served by a local FastAPI microservice
+  // at VOICE_SERVICE_URL (default http://localhost:8808). No cloud keys required.
+
+  /**
+   * Epic 3: Transcribe audio via the local Faster-Whisper service.
+   * @param {Buffer|Uint8Array} audioBuffer - raw bytes of an audio file.
+   * @param {string} filename - filename hint for MIME detection (e.g. voice.ogg).
+   * @returns {Promise<string>} transcribed text.
+   */
+  async transcribeAudio(audioBuffer, filename = 'audio.webm') {
+    // Build multipart form data compatible with UploadFile on the Python side.
+    const form = new FormData();
+    const mime = this._guessAudioMime(filename);
+    form.append('file', new Blob([audioBuffer], { type: mime }), filename);
+
+    let resp;
+    try {
+      resp = await fetch(`${VOICE_SERVICE_URL}/transcribe`, {
+        method: 'POST',
+        body: form
+      });
+    } catch (err) {
+      throw new Error(`Voice service unreachable at ${VOICE_SERVICE_URL}. ` +
+        `Start it with: \`python services/tts/server.py\`. (${err.message})`);
     }
 
-    const voice = options.voice || process.env.VOICE_NAME || 'alloy';
-    const model = options.model || process.env.VOICE_MODEL || 'tts-1';
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(`STT failed (${resp.status}): ${body}`);
+    }
 
-    const response = await this.openaiClient.audio.speech.create({
-      model,
-      voice,
-      input: text,
-      response_format: 'mp3'
-    });
+    const data = await resp.json();
+    return data.text || '';
+  }
 
-    return Buffer.from(await response.arrayBuffer());
+  /**
+   * Epic 4: Synthesize speech via the local VoxCPM2 service.
+   * @param {string} text
+   * @param {object} options
+   * @param {string} [options.referenceWavPath] absolute path to a reference wav for voice cloning.
+   * @returns {Promise<Buffer>} WAV audio bytes.
+   */
+  async textToSpeech(text, options = {}) {
+    if (!text || !text.trim()) throw new Error('textToSpeech requires non-empty text');
+
+    let resp;
+    try {
+      resp = await fetch(`${VOICE_SERVICE_URL}/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          reference_wav_path: options.referenceWavPath || null,
+          cfg_value: options.cfgValue ?? 2.0,
+          inference_timesteps: options.inferenceTimesteps ?? 10
+        })
+      });
+    } catch (err) {
+      throw new Error(`Voice service unreachable at ${VOICE_SERVICE_URL}. ` +
+        `Start it with: \`python services/tts/server.py\`. (${err.message})`);
+    }
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(`TTS failed (${resp.status}): ${body}`);
+    }
+
+    const arrayBuf = await resp.arrayBuffer();
+    return Buffer.from(arrayBuf);
+  }
+
+  _guessAudioMime(filename) {
+    const ext = (filename.split('.').pop() || '').toLowerCase();
+    return {
+      ogg: 'audio/ogg',
+      oga: 'audio/ogg',
+      opus: 'audio/ogg',
+      mp3: 'audio/mpeg',
+      wav: 'audio/wav',
+      webm: 'audio/webm',
+      m4a: 'audio/mp4',
+    }[ext] || 'application/octet-stream';
   }
 
   // ─── Validation ────────────────────────────────────────
@@ -437,6 +780,21 @@ export class AIEngine extends EventEmitter {
     }
   }
 
+  async validateAnthropicKey(apiKey) {
+    try {
+      const testClient = new Anthropic({ apiKey });
+      // A tiny `messages.create` is the cheapest validity probe.
+      await testClient.messages.create({
+        model: 'claude-3-5-haiku-latest',
+        max_tokens: 4,
+        messages: [{ role: 'user', content: 'hi' }]
+      });
+      return { valid: true };
+    } catch (error) {
+      return { valid: false, error: error.message };
+    }
+  }
+
   // Keep backwards compat
   async validateApiKey(apiKey) {
     return this.validateOpenAIKey(apiKey);
@@ -449,7 +807,9 @@ export class AIEngine extends EventEmitter {
       provider: this.provider,
       model: this.model,
       hasOpenAI: !!this.openaiClient,
-      hasGemini: !!this.geminiClient
+      hasGemini: !!this.geminiClient,
+      hasAnthropic: !!this.anthropicClient,
+      voiceServiceUrl: VOICE_SERVICE_URL
     };
   }
 }

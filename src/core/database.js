@@ -63,7 +63,84 @@ export class NexusDatabase {
       CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON conversations(platform);
       CREATE INDEX IF NOT EXISTS idx_platform_sessions ON platform_sessions(platform, platform_user_id);
+
+      -- Epic 2: Long-term semantic memory (local RAG).
+      -- The "vector" column stores a JSON-encoded Float32 array; we read/write it in JS.
+      -- SQLite has no vector type, and importing sqlite-vss onto low-end hardware
+      -- is too heavy, so we do k-NN in pure JS over the memories for a single user.
+      CREATE TABLE IF NOT EXISTS memories (
+        id TEXT PRIMARY KEY,
+        platform TEXT,
+        platform_user_id TEXT,
+        category TEXT,
+        content TEXT NOT NULL,
+        vector TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_memories_user ON memories(platform, platform_user_id);
+      CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
     `);
+
+    try {
+      this.db.exec(`ALTER TABLE conversations ADD COLUMN pending_tool_call TEXT`);
+    } catch (e) {
+      // Ignored if column already exists
+    }
+  }
+
+  // ─── Epic 2: Long-Term Memory ──────────────────────────
+
+  /**
+   * Insert a new memory fact.
+   * @param {object} params
+   * @param {string} params.content   The factual statement to remember.
+   * @param {string} params.category  Free-form bucket (e.g. "preference", "relationship").
+   * @param {number[]} params.vector  Embedding as a plain number[] — serialized as JSON.
+   * @param {string|null} [params.platform]
+   * @param {string|null} [params.platformUserId]
+   * @returns {string} memory id
+   */
+  addMemory({ content, category, vector, platform = null, platformUserId = null }) {
+    if (!content) throw new Error('Memory content is required');
+    if (!Array.isArray(vector)) throw new Error('Memory vector must be an array');
+
+    const id = uuidv4();
+    this.db.prepare(`
+      INSERT INTO memories (id, platform, platform_user_id, category, content, vector)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, platform, platformUserId, category || null, content, JSON.stringify(vector));
+    return id;
+  }
+
+  /**
+   * List memories scoped to a user (or all memories if user params are null).
+   * Returns rows with vector already parsed to a number[].
+   */
+  listMemories({ platform = null, platformUserId = null, limit = 1000 } = {}) {
+    let rows;
+    if (platform && platformUserId) {
+      rows = this.db.prepare(
+        `SELECT id, category, content, vector, created_at
+         FROM memories
+         WHERE platform = ? AND platform_user_id = ?
+         ORDER BY created_at DESC
+         LIMIT ?`
+      ).all(platform, platformUserId, limit);
+    } else {
+      rows = this.db.prepare(
+        `SELECT id, category, content, vector, created_at
+         FROM memories ORDER BY created_at DESC LIMIT ?`
+      ).all(limit);
+    }
+    return rows.map(r => {
+      let parsed = [];
+      try { parsed = JSON.parse(r.vector); } catch (e) { parsed = []; }
+      return { ...r, vector: parsed };
+    });
+  }
+
+  deleteMemory(id) {
+    this.db.prepare('DELETE FROM memories WHERE id = ?').run(id);
   }
 
   // ─── Conversations ─────────────────────────────────────
@@ -168,6 +245,33 @@ export class NexusDatabase {
     }
 
     return session;
+  }
+
+  setPendingToolCall(conversationId, toolCallData) {
+    this.db.prepare(
+      'UPDATE conversations SET pending_tool_call = ? WHERE id = ?'
+    ).run(JSON.stringify(toolCallData), conversationId);
+  }
+
+  getPendingToolCall(conversationId) {
+    const row = this.db.prepare(
+      'SELECT pending_tool_call FROM conversations WHERE id = ?'
+    ).get(conversationId);
+    
+    if (row && row.pending_tool_call) {
+      try {
+        return JSON.parse(row.pending_tool_call);
+      } catch (e) {
+        return null; // Handle malformed JSON
+      }
+    }
+    return null;
+  }
+
+  clearPendingToolCall(conversationId) {
+    this.db.prepare(
+      'UPDATE conversations SET pending_tool_call = NULL WHERE id = ?'
+    ).run(conversationId);
   }
 
   // ─── Search ────────────────────────────────────────────

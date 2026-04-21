@@ -34,8 +34,18 @@ function getPdfParse() {
 }
 
 export class TelegramAdapter {
-  constructor(conversationManager) {
+  /**
+   * @param {import('../core/conversation-manager.js').ConversationManager} conversationManager
+   * @param {object} [options]
+   * @param {import('../core/ai-engine.js').AIEngine} [options.aiEngine]
+   *        Needed for the Voice-In/Voice-Out flow (Epic 4). Optional for
+   *        backwards compatibility — when omitted, voice notes are ignored
+   *        gracefully.
+   */
+  constructor(conversationManager, options = {}) {
     this.cm = conversationManager;
+    // Prefer an explicitly-passed engine, else the one hanging off the CM.
+    this.ai = options.aiEngine || conversationManager?.ai || null;
     this.bot = null;
     this.platform = 'telegram';
   }
@@ -52,24 +62,63 @@ export class TelegramAdapter {
 
       this.bot.on('message', async (msg) => {
         if (msg.text && msg.text.startsWith('/start')) return;
-        if (!msg.text && !msg.document) return;
-        
+
+        // Epic 4: accept voice notes in addition to text + documents.
+        if (!msg.text && !msg.document && !msg.voice) return;
+
         const chatId = msg.chat.id;
         const userId = msg.from.id.toString();
         const displayName = msg.from.first_name || msg.from.username || 'Telegram User';
 
         let promptText = msg.text || '';
+        // When we handle a voice note successfully, we reply with audio — not
+        // plain text. Track this so we can switch output mode.
+        let replyAsVoice = false;
 
-        // Show typing indicator
+        // ─── Epic 4: Voice-In path ───────────────────────────────
+        if (msg.voice) {
+          if (!this.ai) {
+            await this.bot.sendMessage(chatId, '⚠️ Voice messages require the AI engine to be attached. Skipping.');
+            return;
+          }
+
+          try {
+            this.bot.sendChatAction(chatId, 'typing');
+
+            // 1) Download the voice note from Telegram.
+            const fileLink = await this.bot.getFileLink(msg.voice.file_id);
+            const fileRes = await fetch(fileLink);
+            if (!fileRes.ok) throw new Error(`Telegram file fetch failed: ${fileRes.status}`);
+            const audioBuf = Buffer.from(await fileRes.arrayBuffer());
+
+            // 2) Transcribe via local Faster-Whisper (Epic 3).
+            //    Telegram voice notes are always OGG/Opus — hint with .ogg.
+            const transcript = await this.ai.transcribeAudio(audioBuf, 'voice.ogg');
+            if (!transcript || !transcript.trim()) {
+              await this.bot.sendMessage(chatId, "⚠️ Sorry, I couldn't hear anything in that voice note.");
+              return;
+            }
+
+            console.log(`  🎤 [Telegram] Voice transcript: ${transcript.substring(0, 120)}`);
+            promptText = transcript;
+            replyAsVoice = true;
+          } catch (err) {
+            console.error('Voice-in error:', err.message);
+            await this.bot.sendMessage(chatId, `⚠️ Voice transcription failed: ${err.message}`);
+            return;
+          }
+        }
+
+        // Show typing indicator (covers the text + document path too).
         this.bot.sendChatAction(chatId, 'typing');
 
-        // Handle document reading
+        // ─── Document handling (unchanged) ──────────────────────
         if (msg.document) {
           try {
             const fileLink = await this.bot.getFileLink(msg.document.file_id);
             const fileRes = await fetch(fileLink);
             const buffer = await fileRes.arrayBuffer();
-            
+
             if (msg.document.mime_type === 'application/pdf') {
               const pdfData = await getPdfParse()(Buffer.from(buffer));
               promptText += `\n\n[User uploaded PDF: ${msg.document.file_name}]\n${pdfData.text.substring(0, 150000)}`;
@@ -86,17 +135,50 @@ export class TelegramAdapter {
 
         if (!promptText.trim()) return;
 
+        // ─── LLM round-trip ─────────────────────────────────────
+        let response;
         try {
-          const response = await this.cm.processMessage(
+          response = await this.cm.processMessage(
             promptText, this.platform, userId, displayName
           );
-          if (response.content && response.content.trim()) {
-            await this.bot.sendMessage(chatId, response.content);
-          }
         } catch (error) {
           console.error('Telegram error:', error.message);
           await this.bot.sendMessage(chatId, '⚠️ Sorry, I encountered an error. Please try again.');
+          return;
         }
+
+        const replyText = response?.content?.trim();
+        if (!replyText) return;
+
+        // ─── Epic 4: Voice-Out path ────────────────────────────
+        if (replyAsVoice) {
+          try {
+            this.bot.sendChatAction(chatId, 'record_voice');
+            const wavBuf = await this.ai.textToSpeech(replyText);
+
+            // `sendVoice` accepts a Buffer directly. Telegram clients prefer
+            // OGG/Opus for the voice-note UI, but they will still play WAV;
+            // if you want the proper waveform bubble, add an ffmpeg transcode
+            // step inside services/tts/server.py that returns OGG/Opus.
+            await this.bot.sendVoice(chatId, wavBuf, {}, {
+              filename: 'reply.wav',
+              contentType: 'audio/wav'
+            });
+            return;
+          } catch (err) {
+            console.error('Voice-out error:', err.message);
+            // Graceful fallback: send the text so the user still gets the reply.
+            await this.bot.sendMessage(
+              chatId,
+              `${replyText}\n\n_(voice synthesis failed: ${err.message})_`,
+              { parse_mode: 'Markdown' }
+            );
+            return;
+          }
+        }
+
+        // ─── Text reply (original behaviour) ───────────────────
+        await this.bot.sendMessage(chatId, replyText);
       });
 
       let lastConflictWarn = 0;
