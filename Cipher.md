@@ -1,31 +1,26 @@
 # Cipher — Autonomous Academic Automation Agent
 
-Integrated as a new subsystem within the existing **Nexus AI** stack, Cipher adds autonomous portal navigation, assignment tracking, deadline alerting, and scheduled file submission.
+Integrated as a first-class subsystem within the **Nexus AI** stack, Cipher provides autonomous portal navigation, assignment tracking, deadline alerting, and scheduled file submission for university LMS platforms (with a reference implementation against Wright State's D2L Brightspace / PingFederate SSO).
 
-## User Review Required
+---
 
-> [!IMPORTANT]
-> **University Portal URL Required** — What is the exact URL of your university's student portal login page? (e.g., `https://portal.university.edu/login`)
+## Implementation Status
 
-> [!IMPORTANT]
-> **Portal Authentication Method** — Does your portal use:
-> - Standard username/password form?
-> - SSO/OAuth redirect (e.g., Microsoft, Google)?
-> - Multi-factor authentication (MFA)?
-> Please describe the login flow so the navigator can be coded precisely.
+This document was originally written as a design proposal. Every component described below has since been implemented and is live in the current codebase. The originally open architectural questions have been resolved as follows:
 
-> [!WARNING]
-> **Credential Security** — Your .env file currently contains API keys in plaintext. This plan encrypts portal credentials using AES-256-GCM via a master key, stored in a separate encrypted vault file (`data/cipher-vault.enc`). The master key itself lives only in `.env` as `CIPHER_VAULT_KEY`. Is this acceptable, or would you prefer OS-level keychain integration (macOS Keychain)?
+| Original Question | Resolution |
+|---|---|
+| University portal URL & login flow | Configurable per-deployment via `config/cipher-portal.json`. Reference implementation: Wright State Pilot (D2L) with PingFederate SSO redirect to `auth.wright.edu` and Duo 2FA. |
+| Portal authentication method | Full SSO handling in `portal-navigator.js` — detects auto-redirect, falls back to clicking a LOGIN link, waits up to 60 s for Duo 2FA approval, auto-clicks *"Yes, this is my device"*, and retries with exponential backoff on failure. |
+| Credential security | Implemented as proposed — AES-256-GCM with `scrypt` key derivation, unique salt + IV per encryption, stored at `data/cipher-vault.enc`. Master key in `.env` as `CIPHER_VAULT_KEY` (generated via `node src/cipher-cli.js generate-key`). OS-keychain integration was not pursued — the current model is sufficient for single-user local deployments. |
+| Notification channels | Three channels live: Telegram (via the existing bot instance injected by `src/index.js`), macOS Notification Center (via `osascript`), and optional Twilio SMS for HIGH / CRITICAL urgencies. Chat ID configured via `CIPHER_TELEGRAM_CHAT_ID`. |
+| Assignment file paths | Declared in `config/cipher-submissions.json` as `{ coursePattern, assignmentPattern, filePath, submitAt }` entries. `cipher-submitter.matchAndQueue()` matches scanned assignments against this manifest and auto-queues submissions. |
 
-> [!IMPORTANT]
-> **Notification Channels** — Your Telegram bot is already active (`@YourBot`, token configured). Should Cipher:
-> 1. Send alerts via the **existing Telegram bot** to your chat ID?
-> 2. Also trigger **macOS native desktop notifications** (via `osascript`)?
-> 3. Also/instead use **Twilio SMS** (requires separate Twilio credentials)?
-> Please confirm which channels and your Telegram chat ID.
+Cipher also now integrates with the Nexus AI autonomous tooling layer:
 
-> [!IMPORTANT]
-> **Assignment File Paths** — For auto-submission, Cipher needs a mapping of local files → portal dropboxes. Where will you store completed assignment files? (e.g., `~/Assignments/CS101/hw3.pdf`). This will be configured via a JSON manifest.
+- The `cipher_scan_portal`, `cipher_list_assignments`, and `cipher_schedule_submission` tools are available on every supported provider — OpenAI, **Anthropic Claude**, Google Gemini, and NVIDIA NIM — through the provider-agnostic tool schema translator in `ai-engine.js`.
+- Cipher state (due dates, scores, submission status) can be surfaced via **long-term memory** (`save_core_memory`) when the user asks the AI to remember preferences such as *"always submit my CS 4100 homework two hours before the deadline"*.
+- All scheduler activity is recorded in the `cipher_audit_log` table; God Mode's `read_source_file` tool can read the audit records for post-hoc debugging without any special privilege.
 
 ---
 
@@ -418,11 +413,14 @@ node src/cipher-cli.js set-credentials
 
 ---
 
-## Open Questions
+## Operational Notes
 
-> [!IMPORTANT]
-> 1. **What is your university portal URL and login flow?** This is critical for coding the navigator selectors.
-> 2. **What is your Telegram chat ID?** (Send `/start` to `@userinfobot` on Telegram to get it)
-> 3. **Do you want Twilio SMS in addition to Telegram, or is Telegram + macOS notifications sufficient?**
-> 4. **Where do you store your assignment files locally?** (e.g., `~/Documents/Assignments/`)
-> 5. **Are there any specific courses to track, or should Cipher scan all courses on the portal?**
+All of the original blocking questions have been resolved (see *Implementation Status* at the top of this document). A handful of operational points remain worth documenting explicitly:
+
+1. **Portal URL & selectors.** Configured per-deployment in `config/cipher-portal.json`. The setup wizard (`npm run setup`) ships presets for D2L Brightspace, Canvas LMS, and Blackboard; selecting *Custom* prompts for each selector individually.
+2. **Telegram chat ID.** Send `/start` to [@userinfobot](https://t.me/userinfobot) to obtain yours, then set `CIPHER_TELEGRAM_CHAT_ID` in `.env`.
+3. **Multi-channel alerts.** Telegram and macOS notifications are on by default. Twilio SMS activates automatically for HIGH / CRITICAL urgency alerts if `CIPHER_TWILIO_*` env vars are configured; otherwise those urgencies still send to the other channels.
+4. **Local file storage.** `config/cipher-submissions.json` accepts any absolute path on the user's machine. The Submitter verifies file existence at queue time; missing files abort the submission with an audit entry and a notification rather than uploading anything incomplete.
+5. **Course scoping.** By default, Cipher scans every course exposed on the dashboard. A future enhancement (tracked separately) will allow an `includeCourses` / `excludeCourses` allowlist in `cipher-portal.json`.
+
+For architectural detail, data flow, and the full database schema, see [`GUIDE.md`](./GUIDE.md) — Cipher is covered in sections 10 through 15 and 18.
