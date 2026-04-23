@@ -144,6 +144,11 @@ async function main() {
   if (process.env.TELEGRAM_ENABLED === 'true') {
     adapters.telegram = new TelegramAdapter(cm);
     adapterStatus.telegram = await adapters.telegram.start();
+    // Inject bot into ToolExecutor so send_urgent_notification actually sends
+    if (adapterStatus.telegram && adapters.telegram.bot) {
+      cm.toolExecutor.telegramBot = adapters.telegram.bot;
+      console.log('  ✓ Notification bot wired into ToolExecutor');
+    }
   } else {
     adapterStatus.telegram = false;
   }

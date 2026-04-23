@@ -5,6 +5,27 @@ import { PromptLoader } from './prompt-loader.js';
 const MEMORY_TOP_K = 3;
 const MEMORY_MIN_SCORE = 0.15; // cosine-sim floor — below this we treat as irrelevant
 
+// Latency guard: hard cap on autonomous tool iterations per user turn.
+// Before this cap existed, a confused model could spin edit→commit→edit→commit
+// forever and the user would sit on a dead "typing…" for minutes.
+const MAX_TOOL_ITERATIONS = 6;
+
+// Latency guard: skip RAG retrieval for trivially short messages (greetings,
+// "ok", "thanks", etc.). Embedding itself is cheap, but sorting up to 500
+// vectors and injecting 3 memory lines into a greeting adds cost for no
+// signal — and the model often responds to the memory block instead of the
+// actual greeting, which feels weird.
+const GREETING_RE = /^\s*(hi|hello|hey|yo|sup|hola|howdy|greetings|good\s?(morning|afternoon|evening|night)|ok|okay|k|kk|thanks|thank\s?you|ty|cool|nice|lol|lmao|sure|yep|yup|yes|no|nope|nah)[\s!.?]*$/i;
+function _isTrivialQuery(text) {
+  if (!text) return true;
+  const t = String(text).trim();
+  if (!t) return true;
+  if (GREETING_RE.test(t)) return true;
+  // Fewer than 4 words AND short → skip retrieval.
+  const wordCount = t.split(/\s+/).filter(Boolean).length;
+  return wordCount <= 3 && t.length < 25;
+}
+
 export class ConversationManager {
   constructor(database, aiEngine, options = {}) {
     this.db = database;
@@ -12,6 +33,29 @@ export class ConversationManager {
     this.toolExecutor = new ToolExecutor(this);
     this.contextWindow = options.contextWindow || 20;
     this.autoTitle = options.autoTitle !== false;
+
+    // Out-of-band media delivery channels keyed by platform
+    // ('telegram', 'web', …). Adapters register their own handler at
+    // start-up so tools like `take_screenshot` can push images/voice
+    // notes to the user without routing bytes through the LLM.
+    //
+    // Handler signature:
+    //   ({ platformUserId, buffer, filename, mimeType, caption }) => Promise<void>
+    this.mediaChannels = {};
+  }
+
+  /**
+   * Register (or replace) the media channel handler for a given platform.
+   * Called by adapters in their start() method. No-ops safely if `handler`
+   * is falsy so adapters can clear the channel on shutdown.
+   */
+  registerMediaChannel(platform, handler) {
+    if (!platform) return;
+    if (handler) {
+      this.mediaChannels[platform] = handler;
+    } else {
+      delete this.mediaChannels[platform];
+    }
   }
 
   // ─── Helpers ───────────────────────────────────────────
@@ -32,6 +76,9 @@ export class ConversationManager {
    */
   _retrieveMemoryBlock(query, platform, platformUserId) {
     try {
+      // Latency guard: bail fast on greetings and one-word replies.
+      if (_isTrivialQuery(query)) return '';
+
       const memories = this.db.listMemories({ platform, platformUserId, limit: 500 });
       if (!memories.length) return '';
 
@@ -205,7 +252,24 @@ export class ConversationManager {
 
   async _handleToolLoop(initialResponse, contextMessages, conversationId, platform, platformUserId, onChunk = null) {
     let response = initialResponse;
+    let iterations = 0;
     while (response.tool_calls && response.tool_calls.length > 0) {
+      // Latency guard: if the model gets stuck in a tool→tool→tool loop,
+      // stop after MAX_TOOL_ITERATIONS and force a plain-text reply so the
+      // user doesn't wait minutes on a runaway agent.
+      if (iterations >= MAX_TOOL_ITERATIONS) {
+        const safetyNote = (response.content && response.content.trim())
+          ? response.content.trim()
+          : 'I paused after several tool calls to avoid a runaway loop. Let me know how you\'d like to proceed.';
+        console.warn(`[ToolLoop] Hit MAX_TOOL_ITERATIONS (${MAX_TOOL_ITERATIONS}); returning with safety note.`);
+        if (onChunk) {
+          try { onChunk(safetyNote, safetyNote); } catch { /* best-effort */ }
+        }
+        this.db.addMessage(conversationId, 'assistant', safetyNote, platform, response.usage?.totalTokens || 0);
+        return { ...response, content: safetyNote, tool_calls: null };
+      }
+      iterations += 1;
+
       const installIdx = response.tool_calls.findIndex(c => c.function?.name === 'install_npm_package');
 
       if (installIdx !== -1) {

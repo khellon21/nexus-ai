@@ -213,6 +213,27 @@ export const getToolsSchema = (provider) => {
     {
       type: 'function',
       function: {
+        name: 'take_screenshot',
+        description: 'Capture a screenshot of the host machine (the computer this agent is running on) and send it to the user as a photo. OWNER-ONLY — only the trusted owner (identified by OWNER_TELEGRAM_USER_ID) may invoke this. If any other user requests it, the tool will refuse. Use this whenever the owner asks to see what\'s on their screen.',
+        parameters: {
+          type: 'object',
+          properties: {
+            display_index: {
+              type: 'integer',
+              description: 'Optional display number (1 = primary, 2 = secondary…). Defaults to the primary display. Ignored on Linux Wayland.',
+              minimum: 1
+            },
+            caption: {
+              type: 'string',
+              description: 'Optional short caption to accompany the screenshot in the chat.'
+            }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'browser_navigate',
         description: 'Open a local Chrome browser and navigate to a URL. Use this to open any website, log into portals, or do web searches (like duckduckgo.com). Returns the new tab ID.',
         parameters: {
@@ -402,6 +423,9 @@ export class ToolExecutor {
     this.profileId = null;
     this.instanceId = null;
     this.tabId = null;
+    // Injected by index.js after Telegram adapter starts
+    this.telegramBot = null;
+    this.telegramChatId = process.env.CIPHER_TELEGRAM_CHAT_ID || null;
   }
 
   async execute(call, context = {}) {
@@ -427,6 +451,8 @@ export class ToolExecutor {
           return await this.getTime();
         case 'send_urgent_notification':
           return await this.sendNotification(params.message);
+        case 'take_screenshot':
+          return await this.takeScreenshot(params.display_index, params.caption, context);
         case 'browser_navigate':
           return await this.browserNavigate(params.url);
         case 'browser_snapshot':
@@ -620,13 +646,43 @@ export class ToolExecutor {
 
   async sendNotification(message) {
     console.log(`\x1b[31m  [Tool] URGENT NOTIFICATION TO KHELLON: ${message}\x1b[0m`);
-    
-    // In a real scenario, this could ping Telegram, Pushover, or Discord natively.
-    // We can emit an event that the ConversationManager listens to, or just log it.
-    
+
+    const delivered = [];
+    const errors = [];
+
+    // ── 1. Telegram ──────────────────────────────────────────────
+    const bot = this.telegramBot;
+    const chatId = this.telegramChatId || process.env.CIPHER_TELEGRAM_CHAT_ID;
+    if (bot && chatId) {
+      try {
+        const text = `🔔 *NEXUS ALERT*\n\n${message}`;
+        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+        delivered.push('telegram');
+        console.log(`\x1b[32m  [Tool] Notification delivered → Telegram (${chatId})\x1b[0m`);
+      } catch (e) {
+        errors.push(`telegram: ${e.message}`);
+        console.error(`\x1b[31m  [Tool] Telegram notification failed: ${e.message}\x1b[0m`);
+      }
+    } else {
+      errors.push('telegram: bot not initialised or CIPHER_TELEGRAM_CHAT_ID not set');
+    }
+
+    // ── 2. macOS Notification Center ─────────────────────────────
+    if (process.platform === 'darwin' && process.env.CIPHER_MACOS_NOTIFICATIONS !== 'false') {
+      try {
+        const safeMsg = message.replace(/"/g, '\\"').replace(/'/g, "\\'").substring(0, 200);
+        const script = `display notification "${safeMsg}" with title "Nexus AI" subtitle "Urgent Alert"`;
+        await execAsync(`osascript -e '${script}'`);
+        delivered.push('macos');
+      } catch (e) {
+        errors.push(`macos: ${e.message}`);
+      }
+    }
+
     return JSON.stringify({
-      status: "success",
-      delivered_to: "all devices",
+      status: delivered.length > 0 ? 'success' : 'partial_failure',
+      delivered_to: delivered.length > 0 ? delivered : 'none',
+      errors: errors.length > 0 ? errors : undefined,
       timestamp: new Date().toISOString()
     });
   }
@@ -1005,5 +1061,188 @@ export class ToolExecutor {
       stdout: result.stdout.slice(0, 1000),
       stderr: result.stderr.slice(0, 1000),
     });
+  }
+
+  // ─── Screen Capture (owner-only) ───────────────────────
+  //
+  // Security model (decided with Khellon, 2026-04-23):
+  //   • Only the owner — identified by `OWNER_TELEGRAM_USER_ID` env var —
+  //     can trigger a screenshot. Any other user is silently refused.
+  //   • If OWNER_TELEGRAM_USER_ID is unset, screenshots are disabled for
+  //     everyone (fail-closed) so an unconfigured install can never leak
+  //     the host's screen.
+  //   • The captured PNG is delivered out-of-band through the adapter's
+  //     registered media channel (sendPhoto for Telegram) — the LLM never
+  //     sees the image bytes, only a status string.
+  //
+  // Platform dispatch:
+  //   • darwin  → `screencapture -x [-D n] <path>`
+  //   • linux   → `grim` (Wayland) → `scrot` → `import` (ImageMagick)
+  //   • win32   → inline PowerShell using System.Drawing
+  async takeScreenshot(displayIndex, caption, context = {}) {
+    const platform = context.platform;
+    const userId   = context.platformUserId ? String(context.platformUserId) : null;
+
+    // ── Step 1: Owner gate ───────────────────────────────
+    const ownerId = process.env.OWNER_TELEGRAM_USER_ID
+      ? String(process.env.OWNER_TELEGRAM_USER_ID).trim()
+      : null;
+
+    if (!ownerId) {
+      return JSON.stringify({
+        error: 'Screenshot is disabled on this install. The host has not set OWNER_TELEGRAM_USER_ID in .env, so no one can capture the screen. Ask the host to configure their Telegram user ID and restart Nexus.',
+      });
+    }
+
+    // Only the platform we trust (telegram) is owner-gated right now. Other
+    // platforms (web UI, etc.) are denied until a parallel gate is added.
+    if (platform !== 'telegram') {
+      return JSON.stringify({
+        error: `Screenshot is restricted to the Telegram owner. This request came from platform=${platform || 'unknown'}, which is not yet supported.`,
+      });
+    }
+
+    if (!userId || userId !== ownerId) {
+      this._audit('take_screenshot_denied', { platform, userId, reason: 'not-owner' });
+      return JSON.stringify({
+        error: 'Permission denied. Only the host owner can request a screenshot of this machine.',
+      });
+    }
+
+    // ── Step 2: Platform-specific capture to a tempfile ──
+    const outPath = path.join(
+      os.tmpdir(),
+      `nexus-screenshot-${process.pid}-${Date.now()}.png`
+    );
+    const hostOs = process.platform;
+    const display = Number.isInteger(displayIndex) && displayIndex >= 1
+      ? displayIndex
+      : null;
+
+    let capture;
+    try {
+      if (hostOs === 'darwin') {
+        // -x disables the shutter sound, -D selects display (1-indexed).
+        const displayFlag = display ? ` -D ${display}` : '';
+        capture = await execWithTimeout(
+          `screencapture -x${displayFlag} ${JSON.stringify(outPath)}`,
+          { timeoutMs: 15_000 }
+        );
+      } else if (hostOs === 'linux') {
+        capture = await this._linuxCapture(outPath);
+      } else if (hostOs === 'win32') {
+        capture = await this._windowsCapture(outPath);
+      } else {
+        return JSON.stringify({
+          error: `Screenshot is not supported on host OS "${hostOs}". Supported: darwin, linux, win32.`,
+        });
+      }
+
+      if (!capture.ok) {
+        this._audit('take_screenshot', { ok: false, error: capture.message });
+        return JSON.stringify({
+          error: `Screen capture command failed: ${capture.message}`,
+          stderr: (capture.stderr || '').slice(0, 500),
+          hint: hostOs === 'linux'
+            ? 'Install one of: grim (Wayland), scrot, or ImageMagick (for `import`).'
+            : undefined,
+        });
+      }
+
+      // ── Step 3: Load bytes & validate ──────────────────
+      const buf = await fs.readFile(outPath);
+      if (!buf || buf.length < 100) {
+        return JSON.stringify({
+          error: `Screenshot produced an empty/invalid file (${buf?.length || 0} bytes).`,
+        });
+      }
+
+      // ── Step 4: Deliver via adapter media channel ──────
+      const cm = this.conversationManager;
+      const channel = cm?.mediaChannels?.[platform];
+      if (typeof channel !== 'function') {
+        return JSON.stringify({
+          error: 'No media channel is registered for this adapter. The screenshot was captured but cannot be delivered. Restart the bot so the adapter can register its channel.',
+        });
+      }
+
+      try {
+        await channel({
+          platformUserId: userId,
+          buffer: buf,
+          filename: 'screenshot.png',
+          mimeType: 'image/png',
+          caption: caption ? String(caption).slice(0, 256) : undefined,
+        });
+      } catch (deliveryErr) {
+        this._audit('take_screenshot', { ok: false, error: 'delivery: ' + deliveryErr.message });
+        return JSON.stringify({
+          error: `Screenshot was captured but delivery to the chat failed: ${deliveryErr.message}`,
+        });
+      }
+
+      this._audit('take_screenshot', {
+        ok: true,
+        os: hostOs,
+        bytes: buf.length,
+        display: display || 'primary',
+      });
+
+      return JSON.stringify({
+        status: 'success',
+        message: 'Screenshot captured and sent to the user as a photo.',
+        os: hostOs,
+        bytes: buf.length,
+        display: display || 'primary',
+      });
+    } finally {
+      // Best-effort cleanup — we don't want to leave PNGs lying around.
+      fs.unlink(outPath).catch(() => { /* tempfile may not exist */ });
+    }
+  }
+
+  /**
+   * Linux capture: try grim (Wayland), then scrot, then ImageMagick's
+   * `import`. Return the first one that succeeds. We deliberately try
+   * them in order rather than detecting the session type because some
+   * Wayland compositors still ship scrot as a fallback.
+   */
+  async _linuxCapture(outPath) {
+    const candidates = [
+      { cmd: `grim ${JSON.stringify(outPath)}`, name: 'grim' },
+      { cmd: `scrot -o ${JSON.stringify(outPath)}`, name: 'scrot' },
+      { cmd: `import -window root ${JSON.stringify(outPath)}`, name: 'imagemagick' },
+    ];
+    const errors = [];
+    for (const c of candidates) {
+      const result = await execWithTimeout(c.cmd, { timeoutMs: 15_000 });
+      if (result.ok) return result;
+      errors.push(`${c.name}: ${result.message}`);
+    }
+    return {
+      ok: false,
+      message: `All capture backends failed. Tried ${errors.join(' | ')}`,
+      stderr: errors.join('\n'),
+    };
+  }
+
+  /**
+   * Windows capture: PowerShell one-liner using System.Drawing to grab
+   * the virtual screen (all monitors combined) and save to PNG.
+   */
+  async _windowsCapture(outPath) {
+    const escaped = outPath.replace(/'/g, "''");
+    const script =
+      `Add-Type -AssemblyName System.Windows.Forms,System.Drawing; ` +
+      `$b = [System.Windows.Forms.SystemInformation]::VirtualScreen; ` +
+      `$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height; ` +
+      `$g = [System.Drawing.Graphics]::FromImage($bmp); ` +
+      `$g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size); ` +
+      `$bmp.Save('${escaped}', [System.Drawing.Imaging.ImageFormat]::Png); ` +
+      `$g.Dispose(); $bmp.Dispose();`;
+    return execWithTimeout(
+      `powershell -NoProfile -ExecutionPolicy Bypass -Command "${script.replace(/"/g, '\\"')}"`,
+      { timeoutMs: 20_000 }
+    );
   }
 }
