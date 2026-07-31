@@ -114,6 +114,24 @@ async function main() {
     console.log('  \x1b[90m○ Cipher: disabled (set CIPHER_ENABLED=true in .env)\x1b[0m');
   }
 
+  // ─── Start MailEngine — multi-account email ───────────
+  if (process.env.MAIL_ENABLED === 'true') {
+    import('./core/mail-engine.js').then(({ MailEngine }) => {
+      const mailEngine = new MailEngine({ database: db });
+      global.__mailEngine = mailEngine;
+      cm.toolExecutor._mailEngine = mailEngine;
+      mailEngine.start();
+    }).catch(e => {
+      console.error('  ✗ MailEngine failed to load:', e.message);
+      if (/CIPHER_VAULT_KEY/.test(e.message)) {
+        console.error('    Email credentials are stored encrypted and need a vault key.');
+        console.error('    Run: node src/cipher-cli.js generate-key   then put CIPHER_VAULT_KEY=<key> in .env');
+      }
+    });
+  } else {
+    console.log('  \x1b[90m○ Email: disabled (set MAIL_ENABLED=true in .env)\x1b[0m');
+  }
+
   // ─── Initialize Voice ─────────────────────────────────
   // Lifecycle manager owns the Python TTS/STT child: auto-starts it at boot,
   // kills it after 2 min idle to free RAM, re-spawns on demand when a voice
@@ -258,6 +276,15 @@ async function main() {
         global.__cipherScheduler.stop();
       } catch (e) {
         console.error('  Error stopping Cipher:', e.message);
+      }
+    }
+
+    // Stop mail sync
+    if (global.__mailEngine) {
+      try {
+        global.__mailEngine.stop();
+      } catch (e) {
+        console.error('  Error stopping MailEngine:', e.message);
       }
     }
 

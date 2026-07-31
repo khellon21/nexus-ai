@@ -10,6 +10,7 @@
     "setup": "node src/wizard.js",
     "wizard": "node src/wizard.js",
     "cipher": "node src/cipher-cli.js",
+    "mail": "node src/mail-cli.js",
     "cipher:keygen": "node src/cipher-cli.js generate-key",
     "cipher:scan": "node src/cipher-cli.js scan-now",
     "cipher:list": "node src/cipher-cli.js list-assignments"
