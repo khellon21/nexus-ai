@@ -65,6 +65,19 @@ A Playwright-based autonomous agent that seamlessly logs into your university po
 
 See [`Cipher.md`](./Cipher.md) for architecture, state machines, and the full tool registry.
 
+### Email — Read, Triage, Reply (Multi-Account)
+Connect all your inboxes — college **.edu**, **Gmail**, **AOL**, **Yahoo** — over IMAP with app passwords, encrypted at rest in the same AES-256-GCM vault as your portal credentials. Nexus silently syncs new mail into its local database and stays quiet until *you* ask:
+
+> *"Anything important in my email?"*
+
+It answers in two groups — **Important** (VIP senders, anything `.edu`, humans with deadlines/grades/money) and **Less important** (promos, newsletters, automated mail). Replies are drafted by the AI but **never sent without your explicit Yes**.
+
+```bash
+node src/mail-cli.js add-account     # interactive, per-provider app-password help
+node src/mail-cli.js test you@gmail.com
+# then set MAIL_ENABLED=true in .env
+```
+
 ### Everywhere You Already Chat
 Deeply integrated with **Telegram** (primary UI — supports PDFs, voice notes, and send-text-first replies) with first-class adapters for **Discord**, **Slack** (Socket Mode), **WhatsApp** (QR-based), **iMessage** (macOS Full Disk Access), and a premium **web dashboard** (port `3000`).
 
