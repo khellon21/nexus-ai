@@ -20,6 +20,7 @@ export class NexusDatabase {
     this.db.pragma('foreign_keys = ON');
     this._createTables();
     this._createCipherTables();
+    this._createMailTables();
     console.log('  ✓ Database initialized');
   }
 
@@ -493,6 +494,110 @@ export class NexusDatabase {
     return this.db.prepare(
       'SELECT * FROM cipher_audit_log ORDER BY created_at DESC LIMIT ?'
     ).all(limit);
+  }
+
+  // ─── Mail: multi-account email cache ───────────────────
+
+  _createMailTables() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS mail_messages (
+        id TEXT PRIMARY KEY,
+        account TEXT NOT NULL,
+        uid INTEGER NOT NULL,
+        message_id TEXT,
+        from_addr TEXT,
+        from_name TEXT,
+        subject TEXT,
+        preview TEXT,
+        body TEXT,
+        received_at DATETIME,
+        is_edu INTEGER DEFAULT 0,
+        is_vip INTEGER DEFAULT 0,
+        is_automated INTEGER DEFAULT 0,
+        UNIQUE(account, uid)
+      );
+      CREATE TABLE IF NOT EXISTS mail_sync_state (
+        account TEXT PRIMARY KEY,
+        last_uid INTEGER DEFAULT 0,
+        last_sync_at DATETIME,
+        last_error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_mail_received ON mail_messages(received_at);
+      CREATE INDEX IF NOT EXISTS idx_mail_account ON mail_messages(account);
+    `);
+  }
+
+  upsertMailMessage({ account, uid, messageId, fromAddr, fromName, subject, preview, body, receivedAt, isEdu, isVip, isAutomated }) {
+    const existing = this.db.prepare(
+      'SELECT id FROM mail_messages WHERE account = ? AND uid = ?'
+    ).get(account, uid);
+    if (existing) return existing.id;
+
+    const id = uuidv4();
+    this.db.prepare(`
+      INSERT INTO mail_messages (id, account, uid, message_id, from_addr, from_name, subject, preview, body, received_at, is_edu, is_vip, is_automated)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, account, uid, messageId || null, fromAddr || null, fromName || null,
+      subject || null, preview || null, body || null, receivedAt || null,
+      isEdu ? 1 : 0, isVip ? 1 : 0, isAutomated ? 1 : 0);
+    return id;
+  }
+
+  getMailMessage(id) {
+    return this.db.prepare('SELECT * FROM mail_messages WHERE id = ?').get(id);
+  }
+
+  setMailBody(id, body) {
+    this.db.prepare('UPDATE mail_messages SET body = ? WHERE id = ?').run(body, id);
+  }
+
+  listRecentMail({ sinceHours = 48, minCount = 30 } = {}) {
+    const rows = this.db.prepare(
+      'SELECT * FROM mail_messages ORDER BY received_at DESC LIMIT 200'
+    ).all();
+    const cutoff = Date.now() - sinceHours * 3600 * 1000;
+    const withinWindow = rows.filter(r => new Date(r.received_at).getTime() >= cutoff);
+    return withinWindow.length >= minCount ? withinWindow : rows.slice(0, minCount);
+  }
+
+  searchMail({ query, account = null, limit = 20 }) {
+    const like = `%${query}%`;
+    if (account) {
+      return this.db.prepare(`
+        SELECT * FROM mail_messages
+        WHERE account = ? AND (from_addr LIKE ? OR from_name LIKE ? OR subject LIKE ? OR preview LIKE ?)
+        ORDER BY received_at DESC LIMIT ?
+      `).all(account, like, like, like, like, limit);
+    }
+    return this.db.prepare(`
+      SELECT * FROM mail_messages
+      WHERE from_addr LIKE ? OR from_name LIKE ? OR subject LIKE ? OR preview LIKE ?
+      ORDER BY received_at DESC LIMIT ?
+    `).all(like, like, like, like, limit);
+  }
+
+  getMailSyncState(account) {
+    return this.db.prepare('SELECT * FROM mail_sync_state WHERE account = ?').get(account);
+  }
+
+  setMailSyncState(account, { lastUid = null, lastError = null } = {}) {
+    // last_sync_at only advances on success (no error); last_uid only
+    // advances when a new high-water mark is provided.
+    const exists = this.db.prepare('SELECT account FROM mail_sync_state WHERE account = ?').get(account);
+    if (!exists) {
+      this.db.prepare(`
+        INSERT INTO mail_sync_state (account, last_uid, last_sync_at, last_error)
+        VALUES (?, ?, CASE WHEN ? IS NULL THEN CURRENT_TIMESTAMP ELSE NULL END, ?)
+      `).run(account, lastUid ?? 0, lastError, lastError);
+      return;
+    }
+    this.db.prepare(`
+      UPDATE mail_sync_state SET
+        last_uid = COALESCE(?, last_uid),
+        last_sync_at = CASE WHEN ? IS NULL THEN CURRENT_TIMESTAMP ELSE last_sync_at END,
+        last_error = ?
+      WHERE account = ?
+    `).run(lastUid, lastError, lastError, account);
   }
 
   // ─── Lifecycle ─────────────────────────────────────────
