@@ -16,6 +16,30 @@ const MAX_TOOL_ITERATIONS = 6;
 // signal — and the model often responds to the memory block instead of the
 // actual greeting, which feels weird.
 const GREETING_RE = /^\s*(hi|hello|hey|yo|sup|hola|howdy|greetings|good\s?(morning|afternoon|evening|night)|ok|okay|k|kk|thanks|thank\s?you|ty|cool|nice|lol|lmao|sure|yep|yup|yes|no|nope|nah)[\s!.?]*$/i;
+
+// Tools that must never run without an explicit human yes. Each entry
+// formats the approval prompt shown to the user. `db` and parsed `args`
+// are provided; formatters must never throw on malformed args.
+const APPROVAL_GATED_TOOLS = {
+  install_npm_package: {
+    prompt: (args) => {
+      const pkg = args.package_name || 'an unknown package';
+      return `I need to install the package \`${pkg}\` to complete this task. Do you approve? (Reply Yes/No)`;
+    },
+    denialResult: () => JSON.stringify({ error: 'User denied installation.' }),
+    reprompt: (args) => `I still need approval to install \`${args.package_name || 'the package'}\`. Please reply with **Yes** to approve or **No** to deny.`,
+  },
+  reply_to_email: {
+    prompt: (args, db) => {
+      const row = args.message_id ? db.getMailMessage?.(args.message_id) : null;
+      const to = row ? `${row.from_name ? row.from_name + ' ' : ''}<${row.from_addr}>` : 'the sender';
+      const subject = row?.subject || '(unknown subject)';
+      return `Here's my draft reply to ${to} regarding "${subject}":\n\n${args.draft_body || '(empty draft)'}\n\nSend it? (Reply Yes/No)`;
+    },
+    denialResult: () => JSON.stringify({ error: 'User declined to send the reply. Do not resend it; ask what to change instead.' }),
+    reprompt: () => `I still need your approval to send that email reply. Please reply with **Yes** to send or **No** to cancel.`,
+  },
+};
 function _isTrivialQuery(text) {
   if (!text) return true;
   const t = String(text).trim();
@@ -154,22 +178,22 @@ export class ConversationManager {
   }
 
   /**
-   * Persist an install approval prompt, surface the message to the user,
-   * and halt the tool loop. Reused by both the initial intercept path and
-   * the "another install showed up during resume" re-intercept path so
-   * approval can never be bypassed by batching installs.
+   * Persist an approval prompt for a gated tool, surface the message to
+   * the user, and halt the tool loop. Reused by both the initial intercept
+   * path and the "another gated call showed up during resume" re-intercept
+   * path so approval can never be bypassed by batching calls.
    */
-  _askForInstallApproval({ call, remainingOtherCalls, contextMessages, conversationId, platform, onChunk }) {
+  _askForApproval({ call, remainingOtherCalls, contextMessages, conversationId, platform, onChunk }) {
     let argsObj = {};
     try { argsObj = JSON.parse(call.function.arguments || '{}'); } catch {}
-    const pkg = argsObj.package_name || 'an unknown package';
+    const gate = APPROVAL_GATED_TOOLS[call.function.name];
 
-    const msg = `I need to install the package \`${pkg}\` to complete this task. Do you approve? (Reply Yes/No)`;
+    const msg = gate.prompt(argsObj, this.db);
     this.db.addMessage(conversationId, 'assistant', msg, platform);
     if (onChunk) onChunk(msg);
 
     this.db.setPendingToolCall(conversationId, {
-      tool_name: 'install_npm_package',
+      tool_name: call.function.name,
       call_id: call.id,
       args: call.function.arguments,
       context: contextMessages,
@@ -198,8 +222,8 @@ export class ConversationManager {
     if (decision === 'ambiguous') {
       let argsObj = {};
       try { argsObj = JSON.parse(pending.args || '{}'); } catch {}
-      const pkg = argsObj.package_name || 'the package';
-      const msg = `I still need approval to install \`${pkg}\`. Please reply with **Yes** to approve or **No** to deny.`;
+      const gate = APPROVAL_GATED_TOOLS[pending.tool_name] || APPROVAL_GATED_TOOLS.install_npm_package;
+      const msg = gate.reprompt(argsObj);
       this.db.addMessage(conversationId, 'assistant', msg, platform);
       if (onChunk) onChunk(msg);
       // Intentionally leave the pending row in place.
@@ -209,13 +233,14 @@ export class ConversationManager {
     // Clear pending only once we have an unambiguous verdict.
     this.db.clearPendingToolCall(conversationId);
 
+    const gate = APPROVAL_GATED_TOOLS[pending.tool_name] || APPROVAL_GATED_TOOLS.install_npm_package;
     const contextMessages = pending.context;
     const approvedResult = decision === 'yes'
       ? await this.toolExecutor.execute(
           { name: pending.tool_name, arguments: pending.args },
           { platform, platformUserId }
         )
-      : JSON.stringify({ error: 'User denied installation.' });
+      : gate.denialResult();
 
     this._pushToolResult(
       contextMessages,
@@ -223,15 +248,15 @@ export class ConversationManager {
       approvedResult
     );
 
-    // Iterate any sibling tool_calls that were batched with the install.
-    // CRITICAL: if another install_npm_package lurks in other_calls, we
-    // MUST NOT execute it — halt again and request approval, preserving
-    // the still-unprocessed calls for the next resume.
+    // Iterate any sibling tool_calls that were batched with the gated call.
+    // CRITICAL: if another gated tool lurks in other_calls, we MUST NOT
+    // execute it — halt again and request approval, preserving the
+    // still-unprocessed calls for the next resume.
     const otherCalls = pending.other_calls || [];
     for (let i = 0; i < otherCalls.length; i++) {
       const call = otherCalls[i];
-      if (call.function?.name === 'install_npm_package') {
-        return this._askForInstallApproval({
+      if (APPROVAL_GATED_TOOLS[call.function?.name]) {
+        return this._askForApproval({
           call,
           remainingOtherCalls: otherCalls.slice(i + 1),
           contextMessages,
@@ -280,10 +305,10 @@ export class ConversationManager {
       }
       iterations += 1;
 
-      const installIdx = response.tool_calls.findIndex(c => c.function?.name === 'install_npm_package');
+      const gatedIdx = response.tool_calls.findIndex(c => APPROVAL_GATED_TOOLS[c.function?.name]);
 
-      if (installIdx !== -1) {
-        const interceptedNPM = response.tool_calls[installIdx];
+      if (gatedIdx !== -1) {
+        const intercepted = response.tool_calls[gatedIdx];
 
         // Record the assistant turn (with its full tool_calls list) so the
         // context we save is a valid suffix when the model resumes.
@@ -293,14 +318,14 @@ export class ConversationManager {
           tool_calls: response.tool_calls,
         });
 
-        return this._askForInstallApproval({
-          call: interceptedNPM,
-          // Everything BEFORE the install in the batch has already been
+        return this._askForApproval({
+          call: intercepted,
+          // Everything BEFORE the gated call in the batch has already been
           // scheduled by the model but not yet executed — keep them (in
-          // order) so they run on resume AFTER the install result. And
-          // everything after the install stays too; _tryResumePending
-          // walks the full list and re-intercepts if it hits another install.
-          remainingOtherCalls: response.tool_calls.filter((_, idx) => idx !== installIdx),
+          // order) so they run on resume AFTER the gated result. And
+          // everything after it stays too; _tryResumePending walks the full
+          // list and re-intercepts if it hits another gated tool.
+          remainingOtherCalls: response.tool_calls.filter((_, idx) => idx !== gatedIdx),
           contextMessages,
           conversationId,
           platform,
