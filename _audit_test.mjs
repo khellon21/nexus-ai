@@ -7,6 +7,14 @@ import fs from 'fs';
 const DB_PATH = `/tmp/nexus_audit_${process.pid}.db`;
 try { fs.unlinkSync(DB_PATH); } catch {}
 
+// Pre-create workspace USER.md files for the test users so the new-user
+// onboarding flow doesn't intercept the first message of each conversation.
+for (const ws of ['test_u1', 'test_u2']) {
+  const dir = `data/workspaces/${ws}`;
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(`${dir}/USER.md`, '# Test User\nSeeded by _audit_test.mjs\n');
+}
+
 const db = new NexusDatabase(DB_PATH);
 db.initialize();
 
@@ -124,6 +132,9 @@ console.log('TEST 4 PASS ✓');
 // Cleanup
 db.close();
 try { fs.unlinkSync(DB_PATH); } catch {}
+for (const ws of ['test_u1', 'test_u2']) {
+  try { fs.rmSync(`data/workspaces/${ws}`, { recursive: true, force: true }); } catch {}
+}
 try { fs.unlinkSync(target); } catch {}
 try { fs.unlinkSync(big); } catch {}
 

@@ -243,6 +243,9 @@ export class CipherSubmitter {
           (assignment.title || '').toLowerCase().includes(mapping.assignmentPattern.toLowerCase());
 
         if (courseMatch && titleMatch) {
+          // Assignments must carry their DB id (set during upsert) — a
+          // submission queued against undefined would fail at insert time.
+          if (!assignment.id) continue;
           // Check if already queued
           const existing = this.db.getSubmissionForAssignment(assignment.id);
           if (existing) continue;

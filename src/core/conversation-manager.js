@@ -61,6 +61,16 @@ export class ConversationManager {
   // ─── Helpers ───────────────────────────────────────────
 
   /**
+   * New-user onboarding only applies to real chat platforms. Automated
+   * callers (the background monitor's 'system' user) must never be asked
+   * for a name/timezone — they'd be stuck in onboarding mode forever.
+   */
+  _needsOnboarding(platform, platformUserId) {
+    if (platform === 'system') return false;
+    return !PromptLoader.hasUserFile(platform, platformUserId);
+  }
+
+  /**
    * Detect whether the currently-selected model routes to Anthropic.
    * Used to pick the correct tool-result message shape (Epic 1).
    */
@@ -336,7 +346,7 @@ export class ConversationManager {
       return pendingRes;
     }
 
-    const isNewUser = !PromptLoader.hasUserFile(platform, platformUserId);
+    const isNewUser = this._needsOnboarding(platform, platformUserId);
     if (isNewUser) {
       const recent = this.db.getRecentMessages(conversationId, 2);
       if (recent.length === 0) {
@@ -382,7 +392,7 @@ export class ConversationManager {
       return pendingRes;
     }
 
-    const isNewUser = !PromptLoader.hasUserFile(platform, platformUserId);
+    const isNewUser = this._needsOnboarding(platform, platformUserId);
     if (isNewUser) {
       const recent = this.db.getRecentMessages(conversationId, 2);
       if (recent.length === 0) {

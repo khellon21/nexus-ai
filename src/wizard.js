@@ -6,6 +6,7 @@ import { randomBytes } from 'crypto';
 import { dirname } from 'path';
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import Anthropic from '@anthropic-ai/sdk';
 
 const logo = `
 ${chalk.hex('#6C5CE7').bold(`
@@ -45,6 +46,7 @@ async function main() {
     message: 'Choose your AI provider:',
     choices: [
       { name: '🟢 OpenAI       — GPT-4o, GPT-4o Mini  (requires API key)', value: 'openai' },
+      { name: '🟠 Anthropic    — Claude Opus/Sonnet/Haiku (requires API key)', value: 'anthropic' },
       { name: '🔷 Google Gemini — Gemini 2.5 Pro/Flash (requires API key)', value: 'gemini' },
       { name: '🟩 NVIDIA       — Llama 3.1, Nemotron  (build.nvidia.com)', value: 'nvidia' },
       { name: '🔀 All          — Setup all providers (switch in dashboard)', value: 'both' }
@@ -53,6 +55,7 @@ async function main() {
   }]);
 
   let openaiKey = '';
+  let anthropicKey = '';
   let geminiKey = '';
   let nvidiaKey = '';
   let selectedModel = '';
@@ -86,6 +89,42 @@ async function main() {
       console.log(chalk.gray(`  Error: ${error.message}\n`));
       if (provider === 'openai') process.exit(1);
       console.log(chalk.yellow('  Continuing without OpenAI...\n'));
+    }
+  }
+
+  // ─── Anthropic Key ───────────────────────────────────
+
+  if (provider === 'anthropic' || provider === 'both') {
+    console.log(chalk.hex('#D97757').bold('\n  ━━━ Anthropic (Claude) Configuration ━━━'));
+    console.log(chalk.gray('  Get your key at: https://console.anthropic.com\n'));
+
+    const { key } = await inquirer.prompt([{
+      type: 'password',
+      name: 'key',
+      message: 'Anthropic API key:',
+      mask: '•',
+      default: existingConfig.ANTHROPIC_API_KEY || undefined,
+      validate: (input) => {
+        if (!input || input.length < 10) return 'Please enter a valid API key';
+        return true;
+      }
+    }]);
+
+    const spinner = ora('  Validating Anthropic key...').start();
+    try {
+      const client = new Anthropic({ apiKey: key });
+      await client.messages.create({
+        model: 'claude-haiku-4-5',
+        max_tokens: 4,
+        messages: [{ role: 'user', content: 'hi' }]
+      });
+      spinner.succeed(chalk.green('  Anthropic key is valid!'));
+      anthropicKey = key;
+    } catch (error) {
+      spinner.fail(chalk.red('  Invalid Anthropic key.'));
+      console.log(chalk.gray(`  Error: ${error.message}\n`));
+      if (provider === 'anthropic') process.exit(1);
+      console.log(chalk.yellow('  Continuing without Anthropic...\n'));
     }
   }
 
@@ -180,6 +219,15 @@ async function main() {
     );
   }
 
+  if (anthropicKey) {
+    modelChoices.push(
+      new inquirer.Separator(chalk.hex('#D97757')(' ── Anthropic Claude ──')),
+      { name: 'Claude Opus 5     — Most capable (recommended)', value: 'claude-opus-5' },
+      { name: 'Claude Sonnet 5   — Balanced speed & intelligence', value: 'claude-sonnet-5' },
+      { name: 'Claude Haiku 4.5  — Fastest & most affordable', value: 'claude-haiku-4-5' }
+    );
+  }
+
   if (geminiKey) {
     modelChoices.push(
       new inquirer.Separator(chalk.hex('#4285F4')(' ── Google Gemini ──')),
@@ -212,7 +260,9 @@ async function main() {
   }]);
 
   selectedModel = model;
-  const activeProvider = model.startsWith('gemini') ? 'gemini' : (model.includes('/') ? 'nvidia' : 'openai');
+  const activeProvider = model.startsWith('claude') ? 'anthropic'
+    : model.startsWith('gemini') ? 'gemini'
+    : (model.includes('/') ? 'nvidia' : 'openai');
 
   // ─── Step 2: Platform Selection ──────────────────────
 
@@ -237,6 +287,7 @@ async function main() {
   const config = {
     AI_PROVIDER: activeProvider,
     OPENAI_API_KEY: openaiKey || '',
+    ANTHROPIC_API_KEY: anthropicKey || '',
     GEMINI_API_KEY: geminiKey || '',
     NVIDIA_API_KEY: nvidiaKey || '',
     AI_MODEL: selectedModel,
@@ -343,38 +394,20 @@ async function main() {
   // ─── Step 4: Voice Settings ──────────────────────────
 
   console.log(chalk.hex('#6C5CE7').bold('\n  ━━━ Step 3: Voice Settings ━━━\n'));
+  console.log(chalk.gray('  Voice runs fully locally (Faster-Whisper STT + VoxCPM2 TTS).'));
+  console.log(chalk.gray('  No cloud API key needed — just the Python deps:'));
+  console.log(chalk.gray('    pip install fastapi uvicorn python-multipart faster-whisper voxcpm soundfile numpy\n'));
 
-  if (!openaiKey) {
-    console.log(chalk.gray('  Voice requires an OpenAI API key (Whisper + TTS). Skipping.\n'));
-    config.VOICE_ENABLED = 'false';
-  } else {
-    const voiceAnswers = await inquirer.prompt([
-      {
-        type: 'confirm',
-        name: 'voiceEnabled',
-        message: 'Enable voice input/output? (uses OpenAI Whisper + TTS)',
-        default: true
-      },
-      {
-        type: 'list',
-        name: 'voiceName',
-        message: 'Select voice:',
-        choices: [
-          { name: 'Alloy   — Neutral and balanced', value: 'alloy' },
-          { name: 'Echo    — Warm and conversational', value: 'echo' },
-          { name: 'Fable   — Expressive and dynamic', value: 'fable' },
-          { name: 'Onyx    — Deep and authoritative', value: 'onyx' },
-          { name: 'Nova    — Friendly and upbeat', value: 'nova' },
-          { name: 'Shimmer — Clear and precise', value: 'shimmer' }
-        ],
-        default: existingConfig.VOICE_NAME || 'alloy',
-        when: (answers) => answers.voiceEnabled
-      }
-    ]);
+  const voiceAnswers = await inquirer.prompt([
+    {
+      type: 'confirm',
+      name: 'voiceEnabled',
+      message: 'Enable voice input/output? (local Whisper + VoxCPM2)',
+      default: existingConfig.VOICE_ENABLED !== 'false'
+    }
+  ]);
 
-    config.VOICE_ENABLED = voiceAnswers.voiceEnabled ? 'true' : 'false';
-    if (voiceAnswers.voiceName) config.VOICE_NAME = voiceAnswers.voiceName;
-  }
+  config.VOICE_ENABLED = voiceAnswers.voiceEnabled ? 'true' : 'false';
 
   // ─── Step 5: Cipher Academic Agent ──────────────────
 
@@ -826,6 +859,9 @@ AI_MODEL=${config.AI_MODEL}
 # ═══ OpenAI ═══
 OPENAI_API_KEY=${config.OPENAI_API_KEY}
 
+# ═══ Anthropic (Claude) ═══
+ANTHROPIC_API_KEY=${config.ANTHROPIC_API_KEY}
+
 # ═══ Google Gemini ═══
 GEMINI_API_KEY=${config.GEMINI_API_KEY}
 
@@ -877,10 +913,12 @@ SYSTEM_PROMPT=${config.SYSTEM_PROMPT}
 
   // ─── Summary ─────────────────────────────────────────
 
-  const providerLabel = config.AI_PROVIDER === 'gemini' 
-    ? chalk.hex('#4285F4')('Google Gemini') 
+  const providerLabel = config.AI_PROVIDER === 'gemini'
+    ? chalk.hex('#4285F4')('Google Gemini')
     : config.AI_PROVIDER === 'nvidia'
     ? chalk.hex('#76B900')('NVIDIA NIM')
+    : config.AI_PROVIDER === 'anthropic'
+    ? chalk.hex('#D97757')('Anthropic Claude')
     : chalk.hex('#00B894')('OpenAI');
 
   console.log(`
@@ -894,9 +932,10 @@ SYSTEM_PROMPT=${config.SYSTEM_PROMPT}
     Voice:     ${config.VOICE_ENABLED === 'true' ? chalk.green('Enabled') : chalk.gray('Disabled')}
 
     API Keys:
-      OpenAI:  ${openaiKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
-      Gemini:  ${geminiKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
-      NVIDIA:  ${nvidiaKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
+      OpenAI:    ${openaiKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
+      Anthropic: ${anthropicKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
+      Gemini:    ${geminiKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
+      NVIDIA:    ${nvidiaKey ? chalk.green('● Configured') : chalk.gray('○ Not set')}
 
     Platforms:
       Telegram: ${config.TELEGRAM_ENABLED === 'true' ? chalk.green('● Enabled') : chalk.gray('○ Disabled')}

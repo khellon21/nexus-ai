@@ -413,7 +413,6 @@ async function fetchPlatformStatus() {
 
 // ─── Stats ─────────────────────────────────────────────
 async function fetchStats() {
-  openSettings();
   try {
     const [statsRes, statusRes] = await Promise.all([
       fetch('/api/stats'),

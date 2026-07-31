@@ -36,11 +36,9 @@ export class VoiceAdapter {
     if (!this.enabled) throw new Error('Voice is not enabled');
 
     try {
-      const audioBuffer = await this.ai.textToSpeech(text, {
-        voice: options.voice || process.env.VOICE_NAME || 'alloy',
-        model: options.model || process.env.VOICE_MODEL || 'tts-1'
-      });
-      return { audio: audioBuffer, success: true, contentType: 'audio/mpeg' };
+      // The local VoxCPM2 service returns WAV bytes.
+      const audioBuffer = await this.ai.textToSpeech(text, options);
+      return { audio: audioBuffer, success: true, contentType: 'audio/wav' };
     } catch (error) {
       console.error('TTS error:', error.message);
       return { audio: null, success: false, error: error.message };

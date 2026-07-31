@@ -107,7 +107,7 @@ export function createWebServer(conversationManager, voiceAdapter, adapterStatus
 
       const result = await voiceAdapter.synthesize(text, { voice });
       if (result.success) {
-        res.set('Content-Type', 'audio/mpeg');
+        res.set('Content-Type', result.contentType || 'audio/wav');
         res.send(result.audio);
       } else {
         res.status(500).json({ error: result.error });
@@ -170,7 +170,7 @@ export function createWebServer(conversationManager, voiceAdapter, adapterStatus
 
         if (msg.type === 'chat') {
           const { message, conversationId } = msg;
-          
+
           // Send back new conversation ID if needed
           let activeConvId = conversationId;
           if (!activeConvId) {
@@ -178,36 +178,36 @@ export function createWebServer(conversationManager, voiceAdapter, adapterStatus
             ws.send(JSON.stringify({ type: 'conversation_created', conversationId: activeConvId }));
           }
 
-          // Store user message and notify
-          conversationManager.db.addMessage(activeConvId, 'user', message, 'web');
-          ws.send(JSON.stringify({ type: 'user_message_stored', conversationId: activeConvId }));
-
-          // Stream AI response
-          const recentMessages = conversationManager.db.getRecentMessages(activeConvId, 20);
-          const contextMessages = recentMessages.map(m => ({
-            role: m.role,
-            content: m.content
-          }));
-
-          let fullContent = '';
           try {
-            await conversationManager.ai.chatStream(contextMessages, (chunk, full) => {
-              fullContent = full;
-              ws.send(JSON.stringify({ type: 'chunk', content: chunk }));
-            });
+            // Full pipeline: system prompt + memory retrieval + agentic tool
+            // loop + persistence. The manager stores both the user and the
+            // assistant messages itself.
+            const result = await conversationManager.processWebMessageStream(
+              message,
+              activeConvId,
+              (chunk) => {
+                ws.send(JSON.stringify({ type: 'chunk', content: chunk }));
+              }
+            );
 
-            // Store assistant message
-            conversationManager.db.addMessage(activeConvId, 'assistant', fullContent, 'web');
-            ws.send(JSON.stringify({ type: 'done', conversationId: activeConvId, content: fullContent }));
+            ws.send(JSON.stringify({
+              type: 'done',
+              conversationId: result.conversationId || activeConvId,
+              content: result.content || ''
+            }));
 
-            // Auto-title
-            if (recentMessages.length <= 1) {
-              conversationManager._generateTitle(activeConvId, message).then(() => {
-                const conv = conversationManager.db.getConversation(activeConvId);
-                if (conv) {
-                  ws.send(JSON.stringify({ type: 'title_updated', conversationId: activeConvId, title: conv.title }));
-                }
-              }).catch(() => {});
+            // The manager kicks off auto-titling in the background; report the
+            // title to the client once it lands so the sidebar updates live.
+            const beforeTitle = conversationManager.db.getConversation(activeConvId)?.title;
+            if (beforeTitle === 'New Conversation') {
+              setTimeout(() => {
+                try {
+                  const conv = conversationManager.db.getConversation(activeConvId);
+                  if (conv && conv.title !== 'New Conversation') {
+                    ws.send(JSON.stringify({ type: 'title_updated', conversationId: activeConvId, title: conv.title }));
+                  }
+                } catch { /* socket may be closed */ }
+              }, 4000);
             }
           } catch (aiError) {
             ws.send(JSON.stringify({ type: 'error', error: aiError.message }));

@@ -862,7 +862,7 @@ export class AIEngine extends EventEmitter {
       const testClient = new Anthropic({ apiKey });
       // A tiny `messages.create` is the cheapest validity probe.
       await testClient.messages.create({
-        model: 'claude-3-5-haiku-latest',
+        model: 'claude-haiku-4-5',
         max_tokens: 4,
         messages: [{ role: 'user', content: 'hi' }]
       });

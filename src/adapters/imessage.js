@@ -32,8 +32,10 @@ export class IMessageAdapter {
       return false;
     }
 
-    // Set the baseline to now (only process new messages)
-    this.lastMessageTime = Math.floor(Date.now() / 1000) * 1000000000 + 978307200000000000;
+    // Set the baseline to now (only process new messages).
+    // chat.db stores dates as nanoseconds since the Apple epoch (2001-01-01),
+    // so convert: (unix seconds - 978307200) * 1e9.
+    this.lastMessageTime = (Math.floor(Date.now() / 1000) - 978307200) * 1000000000;
 
     const pollMs = parseInt(process.env.IMESSAGE_POLL_INTERVAL) || 3000;
     this.pollInterval = setInterval(() => this._pollMessages(), pollMs);

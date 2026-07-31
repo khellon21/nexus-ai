@@ -168,10 +168,11 @@ export class CipherScheduler {
         return;
       }
 
-      // Upsert to database
+      // Upsert to database. Capture each row's DB id back onto the scraped
+      // object — matchAndQueue() and the submission queue key off it.
       if (this.db) {
         for (const assignment of assignments) {
-          this.db.upsertAssignment(assignment);
+          assignment.id = this.db.upsertAssignment(assignment);
         }
         console.log(`  \x1b[32m[Cipher]\x1b[0m ${assignments.length} assignments synced to database`);
       }

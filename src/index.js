@@ -41,18 +41,31 @@ async function main() {
   const hasOpenAI = process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'sk-your-key-here';
   const hasGemini = !!process.env.GEMINI_API_KEY;
   const hasNVIDIA = !!process.env.NVIDIA_API_KEY;
-  
-  if (!hasOpenAI && !hasGemini && !hasNVIDIA) {
-    console.log('\x1b[33m  ⚠ No AI provider configured. Run "npm run setup" to set up OpenAI, Gemini, or NVIDIA.\x1b[0m\n');
+  const hasAnthropic = process.env.ANTHROPIC_API_KEY && process.env.ANTHROPIC_API_KEY !== 'sk-ant-your-key-here';
+
+  if (!hasOpenAI && !hasGemini && !hasNVIDIA && !hasAnthropic) {
+    console.log('\x1b[33m  ⚠ No AI provider configured. Run "npm run setup" to set up OpenAI, Anthropic, Gemini, or NVIDIA.\x1b[0m\n');
     process.exit(1);
   }
 
   console.log('  Starting Nexus AI...\n');
 
   // ─── Initialize Core ─────────────────────────────────
+  const model = process.env.AI_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  // Provider precedence: explicit AI_PROVIDER → inferred from model name →
+  // whichever single key is configured. Model-name inference matches the
+  // detectProvider() rules in ai-engine.js.
+  const inferredProvider =
+    model.startsWith('claude') ? 'anthropic'
+      : model.startsWith('gemini') ? 'gemini'
+        : model.includes('/') ? 'nvidia'
+          : (hasOpenAI ? 'openai'
+            : hasAnthropic ? 'anthropic'
+              : hasGemini ? 'gemini'
+                : 'nvidia');
   const ai = new AIEngine({
-    model: process.env.AI_MODEL || process.env.OPENAI_MODEL || 'gpt-4o-mini',
-    provider: process.env.AI_PROVIDER || (hasGemini && !hasOpenAI && !hasNVIDIA ? 'gemini' : (hasNVIDIA ? 'nvidia' : 'openai')),
+    model,
+    provider: process.env.AI_PROVIDER || inferredProvider,
     systemPrompt: process.env.SYSTEM_PROMPT
   });
   ai.initialize();
@@ -202,8 +215,11 @@ async function main() {
     console.log(`  │   \x1b[35m✦ Nexus AI is running!\x1b[0m                    │`);
     console.log(`  │                                             │`);
     console.log(`  │   Dashboard: \x1b[36mhttp://localhost:${port}\x1b[0m${' '.repeat(13 - port.toString().length)}│`);
-    const rawProvider = process.env.AI_PROVIDER || 'openai';
-    const providerTag = rawProvider === 'gemini' ? '🔷 Gemini' : rawProvider === 'nvidia' ? '🟢 NVIDIA' : '🟢 OpenAI';
+    const rawProvider = ai.provider || 'openai';
+    const providerTag = rawProvider === 'gemini' ? '🔷 Gemini'
+      : rawProvider === 'nvidia' ? '🟢 NVIDIA'
+      : rawProvider === 'anthropic' ? '🟠 Claude'
+      : '🟢 OpenAI';
     console.log(`  │   Provider:  \x1b[33m${providerTag.padEnd(28)}\x1b[0m│`);
     console.log(`  │   Model:     \x1b[33m${ai.model.padEnd(28)}\x1b[0m│`);
     console.log(`  │                                             │`);
