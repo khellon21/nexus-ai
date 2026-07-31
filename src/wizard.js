@@ -908,6 +908,23 @@ CIPHER_SUMMARY_HOUR=${cipherConfig.summaryHour}
 SYSTEM_PROMPT=${config.SYSTEM_PROMPT}
 `;
 
+  // Preserve settings the wizard doesn't manage (PYTHON_BIN, MAIL_*,
+  // OWNER_TELEGRAM_USER_ID, VOICE_PORT, …). Rewriting .env from the
+  // template used to silently drop them, breaking features configured
+  // outside the wizard.
+  const managedKeys = new Set(
+    [...envContent.matchAll(/^([A-Z0-9_]+)=/gm)].map(m => m[1])
+  );
+  const preserved = Object.entries(existingConfig)
+    .filter(([key]) => !managedKeys.has(key));
+  if (preserved.length > 0) {
+    envContent += `\n# ═══ Preserved settings (not managed by the wizard) ═══\n`;
+    for (const [key, value] of preserved) {
+      envContent += `${key}=${value}\n`;
+    }
+    console.log(chalk.gray(`  ✓ Preserved ${preserved.length} existing setting(s): ${preserved.map(([k]) => k).join(', ')}`));
+  }
+
   writeFileSync('.env', envContent);
   console.log(chalk.green('  ✓ Configuration saved to .env'));
 
