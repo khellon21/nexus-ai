@@ -10,6 +10,7 @@ import { exec } from 'child_process';
 import util from 'util';
 import simpleGit from 'simple-git';
 import { search, SafeSearchType } from 'duck-duck-scrape';
+import { loadVips, saveVips } from './mail-triage.js';
 
 const execAsync = util.promisify(exec);
 
@@ -401,6 +402,78 @@ export const getToolsSchema = (provider) => {
           required: ['package_name']
         }
       }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'check_mailbox',
+        description: 'List recent emails across ALL of the user\'s connected accounts (.edu, Gmail, AOL, Yahoo). Call this whenever the user asks about their email, inbox, or "anything important". Each message carries flags: is_edu and is_vip mean ALWAYS IMPORTANT; is_automated means promotional/newsletter (usually LOW priority). For unflagged mail, judge importance yourself: real humans outrank automated senders; deadlines, grades, money, and time-sensitive requests rank high; promos and social notifications rank low. Present results as two groups: Important and Less important. NEVER report email unprompted.',
+        parameters: {
+          type: 'object',
+          properties: {
+            since_hours: { type: 'integer', description: 'Look-back window in hours (default 48).' }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read_email',
+        description: 'Read the full body of one email, by the id returned from check_mailbox or search_email.',
+        parameters: {
+          type: 'object',
+          properties: {
+            message_id: { type: 'string', description: 'The database id of the email.' }
+          },
+          required: ['message_id']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'search_email',
+        description: 'Search cached emails by sender, name, or subject text. Optionally restrict to one account.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Text to search for.' },
+            account: { type: 'string', description: 'Optional: only this account (email address).' }
+          },
+          required: ['query']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'reply_to_email',
+        description: 'Draft a reply to an email. The draft is shown to the user for approval BEFORE anything is sent — the system enforces this, so write the best complete draft you can. Plain text only.',
+        parameters: {
+          type: 'object',
+          properties: {
+            message_id: { type: 'string', description: 'The database id of the email being replied to.' },
+            draft_body: { type: 'string', description: 'The complete plain-text reply body.' }
+          },
+          required: ['message_id', 'draft_body']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'manage_vip_senders',
+        description: 'Manage the VIP sender list. VIP emails are always ranked important. Entries are full addresses (mom@icloud.com) or bare domains (wright.edu).',
+        parameters: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['add', 'remove', 'list'] },
+            entry: { type: 'string', description: 'Address or domain (not needed for list).' }
+          },
+          required: ['action']
+        }
+      }
     }
   ];
 
@@ -481,6 +554,16 @@ export class ToolExecutor {
           return await this.gitCommitAndPush(params.commit_message);
         case 'install_npm_package':
           return await this.installNpmPackage(params.package_name);
+        case 'check_mailbox':
+          return await this.checkMailbox(params.since_hours);
+        case 'read_email':
+          return await this.readEmail(params.message_id);
+        case 'search_email':
+          return await this.searchEmail(params.query, params.account);
+        case 'reply_to_email':
+          return await this.replyToEmail(params.message_id, params.draft_body);
+        case 'manage_vip_senders':
+          return await this.manageVipSenders(params.action, params.entry);
         default:
           return JSON.stringify({ error: `Unknown tool: ${name}` });
       }
@@ -1061,6 +1144,74 @@ export class ToolExecutor {
       stdout: result.stdout.slice(0, 1000),
       stderr: result.stderr.slice(0, 1000),
     });
+  }
+
+  // ─── Email tools (MailEngine injected by index.js) ────
+
+  _requireMail() {
+    if (!this._mailEngine) {
+      return JSON.stringify({ error: 'Email is not enabled. Set MAIL_ENABLED=true and add accounts with: node src/mail-cli.js add-account' });
+    }
+    return null;
+  }
+
+  async checkMailbox(sinceHours) {
+    const gate = this._requireMail(); if (gate) return gate;
+    const rows = this._mailEngine.db.listRecentMail({ sinceHours: sinceHours || 48 });
+    const messages = rows.map(r => ({
+      id: r.id, account: r.account, from: r.from_addr, from_name: r.from_name,
+      subject: r.subject, preview: r.preview, received_at: r.received_at,
+      is_edu: r.is_edu, is_vip: r.is_vip, is_automated: r.is_automated,
+    }));
+    return JSON.stringify({ messages, accounts: this._mailEngine.getSyncStatus() });
+  }
+
+  async readEmail(messageId) {
+    const gate = this._requireMail(); if (gate) return gate;
+    if (!messageId) return JSON.stringify({ error: 'message_id is required' });
+    try {
+      const row = this._mailEngine.db.getMailMessage(messageId);
+      if (!row) return JSON.stringify({ error: `No email with id ${messageId}` });
+      const body = await this._mailEngine.getBody(messageId);
+      return JSON.stringify({ from: row.from_addr, subject: row.subject, account: row.account,
+        received_at: row.received_at, body: (body || '').slice(0, 20000) });
+    } catch (e) {
+      return JSON.stringify({ error: `Failed to read email: ${e.message}` });
+    }
+  }
+
+  async searchEmail(query, account) {
+    const gate = this._requireMail(); if (gate) return gate;
+    if (!query) return JSON.stringify({ error: 'query is required' });
+    const rows = this._mailEngine.db.searchMail({ query, account: account || null });
+    return JSON.stringify({ results: rows.map(r => ({ id: r.id, account: r.account,
+      from: r.from_addr, subject: r.subject, preview: r.preview, received_at: r.received_at })) });
+  }
+
+  async replyToEmail(messageId, draftBody) {
+    const gate = this._requireMail(); if (gate) return gate;
+    try {
+      const res = await this._mailEngine.sendReply({ messageDbId: messageId, body: draftBody });
+      this._audit('reply_to_email', { ok: true, to: res.to, subject: res.subject });
+      return JSON.stringify({ status: 'success', message: `Reply sent to ${res.to} (${res.subject}) from ${res.from}.` });
+    } catch (e) {
+      this._audit('reply_to_email', { ok: false, error: e.message });
+      return JSON.stringify({ error: `Failed to send reply: ${e.message}` });
+    }
+  }
+
+  async manageVipSenders(action, entry) {
+    const gate = this._requireMail(); if (gate) return gate;
+    const path = this._mailEngine.vipPath;
+    let vips = loadVips(path);
+    if (action === 'add') {
+      if (!entry) return JSON.stringify({ error: 'entry is required for add' });
+      vips = saveVips([...vips, entry], path);
+    } else if (action === 'remove') {
+      if (!entry) return JSON.stringify({ error: 'entry is required for remove' });
+      vips = saveVips(vips.filter(v => v !== String(entry).toLowerCase().trim()), path);
+    }
+    return JSON.stringify({ vips });
   }
 
   // ─── Screen Capture (owner-only) ───────────────────────
